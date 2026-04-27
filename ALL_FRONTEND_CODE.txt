@@ -1,0 +1,1402 @@
+============================================================
+frontend/api_client.py
+============================================================
+"""封装后端 API 调用 — 每次请求从 NiceGUI app.storage.user 读 session_id"""
+import os
+import httpx
+from nicegui import app
+
+API_BASE = os.getenv("API_BASE_URL", "http://localhost:8000/api")
+
+
+def _get_session_id() -> str | None:
+    """从 NiceGUI 用户存储读取 session_id"""
+    try:
+        return app.storage.user.get("session_id")
+    except Exception:
+        return None
+
+
+def _cookies() -> dict:
+    """构造 Cookie dict"""
+    sid = _get_session_id()
+    return {"session_id": sid} if sid else {}
+
+
+def _post(path: str, **kwargs) -> dict:
+    with httpx.Client(base_url=API_BASE, timeout=30) as c:
+        resp = c.post(path, cookies=_cookies(), **kwargs)
+        return resp.json()
+
+
+def _get(path: str, **kwargs) -> dict:
+    with httpx.Client(base_url=API_BASE, timeout=30) as c:
+        resp = c.get(path, cookies=_cookies(), **kwargs)
+        return resp.json()
+
+
+def _put(path: str, **kwargs) -> dict:
+    with httpx.Client(base_url=API_BASE, timeout=30) as c:
+        resp = c.put(path, cookies=_cookies(), **kwargs)
+        return resp.json()
+
+
+def _delete(path: str, **kwargs) -> dict:
+    with httpx.Client(base_url=API_BASE, timeout=30) as c:
+        resp = c.delete(path, cookies=_cookies(), **kwargs)
+        return resp.json()
+
+
+class ApiClient:
+
+    # ---------- 认证 ----------
+    def login(self, username: str, password: str) -> dict:
+        """登录 — 特殊处理：需要从 response 提取 session_id cookie"""
+        with httpx.Client(base_url=API_BASE, timeout=30) as c:
+            resp = c.post("/auth/login", json={"username": username, "password": password})
+            data = resp.json()
+            # 把后端返回的 session_id cookie 存到 NiceGUI user storage
+            sid = resp.cookies.get("session_id")
+            if sid:
+                app.storage.user["session_id"] = sid
+            return data
+
+    def logout(self) -> dict:
+        result = _post("/auth/logout")
+        try:
+            app.storage.user.pop("session_id", None)
+        except Exception:
+            pass
+        return result
+
+    def get_me(self) -> dict:
+        return _get("/auth/me")
+
+    # ---------- 物品 ----------
+    def list_items(self, **params) -> dict:
+        return _get("/items", params=params)
+
+    def get_item(self, item_id: int) -> dict:
+        return _get(f"/items/{item_id}")
+
+    def create_item(self, data: dict) -> dict:
+        return _post("/items", json=data)
+
+    def update_item(self, item_id: int, data: dict) -> dict:
+        return _put(f"/items/{item_id}", json=data)
+
+    def delete_item(self, item_id: int) -> dict:
+        return _delete(f"/items/{item_id}")
+
+    def get_categories(self) -> dict:
+        return _get("/items/categories")
+
+    def get_qrcode_url(self, item_id: int) -> str:
+        """返回二维码图片的完整 URL（含 session cookie 无法直接用，走代理）"""
+        return f"{API_BASE.replace('/api', '')}/api/items/{item_id}/qrcode"
+
+    # ---------- 借用 ----------
+    def borrow_item(self, item_id: int, due_date: str, purpose: str = "") -> dict:
+        return _post("/borrows", json={
+            "item_id": item_id, "due_date": due_date, "purpose": purpose,
+        })
+
+    def return_item(self, borrow_id: int, return_note: str = "") -> dict:
+        return _put(f"/borrows/{borrow_id}/return", json={"return_note": return_note})
+
+    def list_borrows(self, **params) -> dict:
+        return _get("/borrows", params=params)
+
+    def my_borrows(self, **params) -> dict:
+        return _get("/borrows/my", params=params)
+
+    def list_overdue(self) -> dict:
+        return _get("/borrows/overdue")
+
+    # ---------- 报废 ----------
+    def apply_scrap(self, item_id: int, reason: str) -> dict:
+        return _post("/scraps", json={"item_id": item_id, "reason": reason})
+
+    def approve_scrap(self, scrap_id: int, note: str = "") -> dict:
+        return _put(f"/scraps/{scrap_id}/approve", json={"approve_note": note})
+
+    def reject_scrap(self, scrap_id: int, note: str = "") -> dict:
+        return _put(f"/scraps/{scrap_id}/reject", json={"approve_note": note})
+
+    def list_scraps(self, **params) -> dict:
+        return _get("/scraps", params=params)
+
+    # ---------- 用户 ----------
+    def list_users(self, **params) -> dict:
+        return _get("/users", params=params)
+
+    def create_user(self, data: dict) -> dict:
+        return _post("/users", json=data)
+
+    def update_user(self, user_id: int, data: dict) -> dict:
+        return _put(f"/users/{user_id}", json=data)
+
+    def disable_user(self, user_id: int) -> dict:
+        return _put(f"/users/{user_id}/disable")
+
+    # ---------- 仪表盘 ----------
+    def get_stats(self) -> dict:
+        return _get("/dashboard/stats")
+
+    def get_top_borrowed(self, limit: int = 10) -> dict:
+        return _get("/dashboard/top-borrowed", params={"limit": limit})
+
+
+# 全局单例
+api = ApiClient()
+
+============================================================
+frontend/main.py
+============================================================
+"""NiceGUI 前端入口"""
+import os
+from nicegui import ui, app
+
+# 全局状态：当前登录用户信息
+# 存储在 app.storage.user 中（NiceGUI 自带 per-user storage）
+
+FRONTEND_PORT = int(os.getenv("FRONTEND_PORT", "8080"))
+
+
+def init_routes():
+    """注册所有页面路由"""
+    from pages.login import login_page
+    from pages.dashboard import dashboard_page
+    from pages.items import items_page
+    from pages.item_create import item_create_page      # 固定路径必须在动态路径之前
+    from pages.item_detail import item_detail_page
+    from pages.borrows import borrows_page
+    from pages.my_borrows import my_borrows_page
+    from pages.scraps import scraps_page
+    from pages.users import users_page
+
+
+init_routes()
+
+ui.run(
+    title="学校物品二维码管理系统",
+    port=FRONTEND_PORT,
+    storage_secret="school-qr-storage-secret",
+    dark=False,
+)
+
+============================================================
+frontend/components/__init__.py
+============================================================
+
+
+============================================================
+frontend/components/navbar.py
+============================================================
+"""顶部导航栏组件"""
+from nicegui import ui, app
+from api_client import api
+
+
+def navbar():
+    """渲染顶部导航栏，根据用户角色显示不同菜单"""
+    user = app.storage.user.get("user")
+    if not user:
+        return
+
+    role = user.get("role", "")
+    real_name = user.get("real_name", "")
+
+    with ui.header().classes("bg-blue-8 text-white shadow-2 items-center justify-between"):
+        with ui.row().classes("items-center gap-0"):
+            ui.label("📦 物品管理系统").classes("text-h6 q-mr-md cursor-pointer").on("click", lambda: ui.navigate.to("/dashboard"))
+
+            ui.button("仪表盘", icon="dashboard", on_click=lambda: ui.navigate.to("/dashboard")).props("flat color=white")
+            ui.button("物品管理", icon="inventory_2", on_click=lambda: ui.navigate.to("/items")).props("flat color=white")
+            ui.button("借用管理", icon="swap_horiz", on_click=lambda: ui.navigate.to("/borrows")).props("flat color=white")
+            ui.button("我的借用", icon="person", on_click=lambda: ui.navigate.to("/my-borrows")).props("flat color=white")
+            ui.button("报废管理", icon="delete_forever", on_click=lambda: ui.navigate.to("/scraps")).props("flat color=white")
+
+            if role == "admin":
+                ui.button("用户管理", icon="group", on_click=lambda: ui.navigate.to("/users")).props("flat color=white")
+
+        with ui.row().classes("items-center"):
+            role_labels = {"admin": "管理员", "staff": "教职工", "student": "学生"}
+            ui.badge(role_labels.get(role, role), color="white", text_color="blue-8").classes("q-mr-sm")
+            ui.label(real_name).classes("q-mr-md")
+            ui.button("退出", icon="logout", on_click=_logout).props("flat color=white")
+
+
+async def _logout():
+    """退出登录"""
+    try:
+        api.logout()
+    except Exception:
+        pass
+    app.storage.user.clear()
+    ui.navigate.to("/login")
+
+============================================================
+frontend/components/status_badge.py
+============================================================
+"""状态标签组件 — 不同状态用不同颜色"""
+from nicegui import ui
+
+
+# 物品状态
+ITEM_STATUS = {
+    "available": ("可用", "green"),
+    "borrowed": ("已借出", "orange"),
+    "pending_scrap": ("待报废", "red"),
+    "scrapped": ("已报废", "grey"),
+}
+
+# 借用状态
+BORROW_STATUS = {
+    "active": ("借用中", "blue"),
+    "returned": ("已归还", "green"),
+    "overdue": ("逾期", "red"),
+}
+
+# 报废状态
+SCRAP_STATUS = {
+    "pending": ("待审批", "orange"),
+    "approved": ("已通过", "green"),
+    "rejected": ("已驳回", "red"),
+}
+
+
+def item_status_badge(status: str):
+    """物品状态标签"""
+    label, color = ITEM_STATUS.get(status, (status, "grey"))
+    ui.badge(label, color=color)
+
+
+def borrow_status_badge(status: str):
+    """借用状态标签"""
+    label, color = BORROW_STATUS.get(status, (status, "grey"))
+    ui.badge(label, color=color)
+
+
+def scrap_status_badge(status: str):
+    """报废状态标签"""
+    label, color = SCRAP_STATUS.get(status, (status, "grey"))
+    ui.badge(label, color=color)
+
+============================================================
+frontend/pages/__init__.py
+============================================================
+
+
+============================================================
+frontend/pages/borrows.py
+============================================================
+"""借用管理页（全部借用记录）"""
+from nicegui import ui, app
+from api_client import api
+from components.navbar import navbar
+from components.status_badge import BORROW_STATUS
+
+
+@ui.page("/borrows")
+def borrows_page():
+    if not app.storage.user.get("user") or not app.storage.user.get("session_id"):
+        ui.navigate.to("/login")
+        return
+
+    navbar()
+    user = app.storage.user["user"]
+    is_admin = user.get("role") == "admin"
+
+    with ui.column().classes("q-pa-md w-full max-w-6xl mx-auto"):
+        ui.label("借用管理").classes("text-h5")
+
+        # 筛选
+        with ui.row().classes("w-full gap-2 q-mt-md"):
+            status_select = ui.select(
+                {"": "全部", "active": "借用中", "returned": "已归还", "overdue": "逾期"},
+                value="",
+            ).classes("w-40").props("outlined dense")
+            search_btn = ui.button("筛选", icon="filter_list").props("color=blue")
+
+        table_container = ui.column().classes("w-full q-mt-md")
+
+        def load_borrows(page=1):
+            table_container.clear()
+            params = {"page": page, "page_size": 20}
+            if status_select.value:
+                params["status"] = status_select.value
+
+            try:
+                result = api.list_borrows(**params)
+                if result.get("code") != 0:
+                    with table_container:
+                        ui.label(f"加载失败: {result.get('msg')}").classes("text-red")
+                    return
+
+                data = result["data"]
+                records = data.get("items", [])
+                total = data.get("total", 0)
+
+                with table_container:
+                    if not records:
+                        ui.label("暂无借用记录").classes("text-grey text-center q-pa-lg")
+                        return
+
+                    columns = [
+                        {"name": "item_code", "label": "物品编号", "field": "item_code", "align": "left"},
+                        {"name": "item_name", "label": "物品名称", "field": "item_name", "align": "left"},
+                        {"name": "user_name", "label": "借用人", "field": "user_name", "align": "left"},
+                        {"name": "borrow_date", "label": "借出日期", "field": "borrow_date", "align": "left"},
+                        {"name": "due_date", "label": "应还日期", "field": "due_date", "align": "left"},
+                        {"name": "status", "label": "状态", "field": "status_label", "align": "center"},
+                        {"name": "action", "label": "操作", "field": "action", "align": "center"},
+                    ]
+                    rows = []
+                    for r in records:
+                        status_label = BORROW_STATUS.get(r["status"], (r["status"],))[0]
+                        rows.append({
+                            "id": r["id"],
+                            "item_id": r["item_id"],
+                            "item_code": r.get("item_code", ""),
+                            "item_name": r.get("item_name", ""),
+                            "user_name": r.get("user_name", ""),
+                            "borrow_date": r.get("borrow_date", "")[:10],
+                            "due_date": str(r.get("due_date", "")),
+                            "status": r["status"],
+                            "status_label": status_label,
+                        })
+
+                    table = ui.table(columns=columns, rows=rows, row_key="id").classes("w-full")
+
+                    # 只有 active/overdue 状态且 (本人或管理员) 才能归还
+                    table.add_slot("body-cell-action", '''
+                        <q-td :props="props">
+                            <q-btn v-if="props.row.status === 'active' || props.row.status === 'overdue'"
+                                   flat dense color="green" label="归还"
+                                   @click="$parent.$emit('return_item', props.row)" />
+                            <q-btn flat dense color="blue" icon="visibility"
+                                   @click="$parent.$emit('view_item', props.row)" />
+                        </q-td>
+                    ''')
+                    table.on("return_item", lambda e: _show_return_dialog(e.args["id"], load_borrows))
+                    table.on("view_item", lambda e: ui.navigate.to(f"/items/{e.args['item_id']}"))
+
+                    # 分页
+                    total_pages = (total + 19) // 20
+                    if total_pages > 1:
+                        with ui.row().classes("w-full justify-center q-mt-md"):
+                            for p in range(1, total_pages + 1):
+                                btn = ui.button(str(p), on_click=lambda _, pg=p: load_borrows(pg))
+                                if p == page:
+                                    btn.props("color=blue")
+                                else:
+                                    btn.props("flat")
+
+            except Exception as e:
+                with table_container:
+                    ui.label(f"请求失败: {e}").classes("text-red")
+
+        search_btn.on_click(lambda: load_borrows())
+        load_borrows()
+
+
+def _show_return_dialog(borrow_id: int, reload_fn):
+    with ui.dialog() as dialog, ui.card().classes("w-96"):
+        ui.label("归还物品").classes("text-h6")
+        return_note = ui.input("物品状况备注", placeholder="如：完好无损").classes("full-width").props("outlined")
+        msg = ui.label("").classes("text-red")
+
+        with ui.row().classes("full-width justify-end gap-2"):
+            ui.button("取消", on_click=dialog.close).props("flat")
+
+            def do_return():
+                result = api.return_item(borrow_id, return_note.value or "")
+                if result.get("code") == 0:
+                    dialog.close()
+                    ui.notify("归还成功！", type="positive")
+                    reload_fn()
+                else:
+                    msg.text = result.get("msg", "归还失败")
+
+            ui.button("确认归还", on_click=do_return).props("color=green")
+    dialog.open()
+
+============================================================
+frontend/pages/dashboard.py
+============================================================
+"""仪表盘页"""
+from nicegui import ui, app
+from api_client import api
+from components.navbar import navbar
+
+
+@ui.page("/dashboard")
+def dashboard_page():
+    if not app.storage.user.get("user") or not app.storage.user.get("session_id"):
+        ui.navigate.to("/login")
+        return
+
+    navbar()
+
+    with ui.column().classes("q-pa-md w-full max-w-6xl mx-auto"):
+        ui.label("仪表盘").classes("text-h5 q-mb-md")
+
+        # 统计卡片
+        try:
+            result = api.get_stats()
+            stats = result.get("data", {}) if result.get("code") == 0 else {}
+        except Exception:
+            stats = {}
+
+        with ui.row().classes("w-full gap-4"):
+            _stat_card("物品总数", stats.get("total_items", 0), "inventory_2", "blue")
+            _stat_card("可用", stats.get("available_count", 0), "check_circle", "green")
+            _stat_card("在借", stats.get("borrowed_count", 0), "swap_horiz", "orange")
+            _stat_card("逾期", stats.get("overdue_count", 0), "warning", "red")
+            _stat_card("已报废", stats.get("scrapped_count", 0), "delete", "grey")
+
+        # 借用频次 Top 10
+        with ui.row().classes("w-full gap-4 q-mt-lg"):
+            with ui.card().classes("flex-1"):
+                ui.label("📊 借用频次 Top 10").classes("text-h6 q-mb-sm")
+                try:
+                    result = api.get_top_borrowed(limit=10)
+                    top_list = result.get("data", []) if result.get("code") == 0 else []
+                except Exception:
+                    top_list = []
+
+                if top_list:
+                    max_count = max(item["borrow_count"] for item in top_list) if top_list else 1
+                    for item in top_list:
+                        pct = int(item["borrow_count"] / max_count * 100)
+                        with ui.row().classes("w-full items-center gap-2"):
+                            ui.label(item["name"]).classes("w-32 text-right")
+                            ui.linear_progress(value=pct / 100, show_value=False).classes("flex-1").props("color=blue")
+                            ui.label(str(item["borrow_count"])).classes("w-8")
+                else:
+                    ui.label("暂无借用记录").classes("text-grey")
+
+            with ui.card().classes("flex-1"):
+                ui.label("⏰ 快捷操作").classes("text-h6 q-mb-sm")
+                ui.button("物品列表", icon="inventory_2", on_click=lambda: ui.navigate.to("/items")).classes("full-width q-mb-sm")
+                ui.button("录入物品", icon="add_circle", on_click=lambda: ui.navigate.to("/items/create")).classes("full-width q-mb-sm")
+                ui.button("我的借用", icon="person", on_click=lambda: ui.navigate.to("/my-borrows")).classes("full-width q-mb-sm")
+                ui.button("报废管理", icon="delete_forever", on_click=lambda: ui.navigate.to("/scraps")).classes("full-width")
+
+
+def _stat_card(title: str, value: int, icon: str, color: str):
+    """统计卡片"""
+    with ui.card().classes("flex-1 text-center q-pa-md"):
+        ui.icon(icon, size="2em", color=color)
+        ui.label(str(value)).classes(f"text-h4 text-{color}")
+        ui.label(title).classes("text-grey")
+
+============================================================
+frontend/pages/item_create.py
+============================================================
+"""物品录入页（Admin）"""
+import re
+from nicegui import ui, app
+from api_client import api
+from components.navbar import navbar
+
+
+def _normalize_date(s: str) -> str | None:
+    """把各种日期格式统一为 YYYY-MM-DD"""
+    s = s.strip()
+    if not s:
+        return None
+    # 已经是 YYYY-MM-DD
+    if re.match(r"^\d{4}-\d{2}-\d{2}$", s):
+        return s
+    # YYYYMMDD → YYYY-MM-DD
+    if re.match(r"^\d{8}$", s):
+        return f"{s[:4]}-{s[4:6]}-{s[6:8]}"
+    # YYYY/MM/DD → YYYY-MM-DD
+    if re.match(r"^\d{4}/\d{2}/\d{2}$", s):
+        return s.replace("/", "-")
+    return s  # 原样返回，让后端校验
+
+
+@ui.page("/items/create")
+def item_create_page():
+    if not app.storage.user.get("user") or not app.storage.user.get("session_id"):
+        ui.navigate.to("/login")
+        return
+
+    user = app.storage.user["user"]
+    if user.get("role") != "admin":
+        ui.navigate.to("/items")
+        return
+
+    navbar()
+
+    with ui.column().classes("q-pa-md w-full max-w-3xl mx-auto"):
+        with ui.row().classes("items-center gap-4"):
+            ui.button(icon="arrow_back", on_click=lambda: ui.navigate.to("/items")).props("flat round")
+            ui.label("录入物品").classes("text-h5")
+
+        # 加载分类列表
+        categories = {}
+        try:
+            result = api.get_categories()
+            if result.get("code") == 0:
+                for c in result["data"]:
+                    categories[c["id"]] = c["name"]
+        except Exception:
+            pass
+
+        with ui.card().classes("w-full q-mt-md q-pa-lg"):
+            name = ui.input("物品名称 *", placeholder="如：投影仪").classes("full-width").props("outlined")
+            category = ui.select(categories, label="分类").classes("full-width").props("outlined")
+            model_input = ui.input("型号/规格", placeholder="如：EPSON CB-X06").classes("full-width").props("outlined")
+            with ui.input("购入日期", placeholder="YYYY-MM-DD").classes("full-width").props("outlined") as purchase_date:
+                with ui.menu().props("no-parent-event") as menu:
+                    with ui.date(mask="YYYY-MM-DD").bind_value(purchase_date) as dp:
+                        with ui.row().classes("justify-end"):
+                            ui.button("确定", on_click=menu.close).props("flat")
+                with purchase_date.add_slot("append"):
+                    ui.icon("edit_calendar").on("click", menu.open).classes("cursor-pointer")
+            purchase_price = ui.input("购入价格", placeholder="如：3500.00").classes("full-width").props("outlined type=number")
+            location = ui.input("存放位置", placeholder="如：教学楼A栋 301室").classes("full-width").props("outlined")
+            remark = ui.textarea("备注").classes("full-width").props("outlined")
+
+            msg = ui.label("").classes("text-red q-mt-sm")
+
+            def do_create():
+                if not name.value:
+                    msg.text = "请填写物品名称"
+                    return
+
+                data = {"name": name.value}
+                if category.value:
+                    data["category_id"] = category.value
+                if model_input.value:
+                    data["model"] = model_input.value
+                if purchase_date.value:
+                    d = _normalize_date(purchase_date.value)
+                    if d:
+                        data["purchase_date"] = d
+                if purchase_price.value:
+                    try:
+                        data["purchase_price"] = float(purchase_price.value)
+                    except ValueError:
+                        msg.text = "购入价格格式不正确"
+                        return
+                if location.value:
+                    data["location"] = location.value
+                if remark.value:
+                    data["remark"] = remark.value
+                try:
+                    result = api.create_item(data)
+                    if result.get("code") == 0:
+                        ui.notify("物品录入成功！", type="positive")
+                        item_id = result["data"]["id"]
+                        ui.navigate.to(f"/items/{item_id}")
+                    else:
+                        msg.text = result.get("msg", "录入失败")
+                except Exception as e:
+                    msg.text = f"请求失败: {e}"
+
+            with ui.row().classes("full-width justify-end gap-2 q-mt-md"):
+                ui.button("取消", on_click=lambda: ui.navigate.to("/items")).props("flat")
+                ui.button("确认录入", icon="save", on_click=do_create).props("color=blue")
+
+============================================================
+frontend/pages/item_detail.py
+============================================================
+"""物品详情页 — 扫码跳转目标（公开可查看，操作需登录）"""
+from nicegui import ui, app
+from api_client import api, _get, API_BASE
+from components.navbar import navbar
+from components.status_badge import item_status_badge, ITEM_STATUS
+
+
+@ui.page("/items/{item_id}")
+def item_detail_page(item_id: int):
+    # 判断是否已登录
+    logged_in = bool(app.storage.user.get("user") and app.storage.user.get("session_id"))
+    user = app.storage.user.get("user") if logged_in else None
+
+    # 已登录显示导航栏
+    if logged_in:
+        navbar()
+
+    with ui.column().classes("q-pa-md w-full max-w-4xl mx-auto"):
+        # 未登录提示条
+        if not logged_in:
+            with ui.card().classes("w-full q-mb-md bg-blue-1"):
+                with ui.row().classes("items-center gap-4"):
+                    ui.icon("info", color="blue").classes("text-h5")
+                    ui.label("您当前未登录，仅可查看物品信息。登录后可借用/归还物品。")
+                    ui.button("去登录", on_click=lambda: _go_login(item_id)).props("color=blue flat")
+
+        try:
+            # 公开接口，不需要 cookie
+            import httpx
+            with httpx.Client(base_url=API_BASE, timeout=30) as c:
+                resp = c.get(f"/items/{item_id}")
+                result = resp.json()
+
+            if result.get("code") != 0:
+                ui.label(f"❌ {result.get('msg', '物品不存在')}").classes("text-h5 text-red")
+                return
+
+            item = result["data"]
+        except Exception as e:
+            ui.label(f"请求失败: {e}").classes("text-red")
+            return
+
+        # 标题行
+        with ui.row().classes("items-center gap-4"):
+            if logged_in:
+                ui.button(icon="arrow_back", on_click=lambda: ui.navigate.to("/items")).props("flat round")
+            ui.label("物品详情").classes("text-h5")
+
+        # 详情卡片
+        with ui.card().classes("w-full q-mt-md q-pa-lg"):
+            with ui.row().classes("w-full gap-8"):
+                # 左侧信息
+                with ui.column().classes("flex-1"):
+                    _info_row("名称", item["name"])
+                    _info_row("编号", item["code"])
+                    with ui.row().classes("items-center gap-2"):
+                        ui.label("状态:").classes("text-bold w-20")
+                        item_status_badge(item["status"])
+                    _info_row("分类", item.get("category_name") or "-")
+                    _info_row("型号", item.get("model") or "-")
+                    _info_row("位置", item.get("location") or "-")
+                    _info_row("购入日期", item.get("purchase_date") or "-")
+                    price = item.get("purchase_price")
+                    _info_row("购入价格", f"¥{price}" if price else "-")
+                    _info_row("备注", item.get("remark") or "-")
+
+                # 右侧二维码
+                with ui.column().classes("items-center"):
+                    ui.label("二维码").classes("text-bold q-mb-sm")
+                    qr_url = api.get_qrcode_url(item_id)
+                    ui.image(qr_url).classes("w-40 h-40")
+
+        # 操作按钮（仅登录用户可见）
+        if logged_in:
+            action_row = ui.row().classes("q-mt-md gap-2")
+            with action_row:
+                if item["status"] == "available":
+                    ui.button("借用此物品", icon="shopping_cart", on_click=lambda: _show_borrow_dialog(item_id)).props("color=blue")
+
+                if item["status"] in ("available", "borrowed"):
+                    ui.button("申请报废", icon="delete_forever", on_click=lambda: _show_scrap_dialog(item_id)).props("color=red outline")
+        else:
+            with ui.row().classes("q-mt-md"):
+                ui.button("登录后借用", icon="login", on_click=lambda: _go_login(item_id)).props("color=blue outline")
+
+        # 借用历史
+        ui.label("📋 借用历史").classes("text-h6 q-mt-lg")
+        history = item.get("borrow_history", [])
+        if history:
+            columns = [
+                {"name": "user", "label": "借用人", "field": "user_name", "align": "left"},
+                {"name": "borrow", "label": "借出日期", "field": "borrow_date", "align": "left"},
+                {"name": "due", "label": "应还日期", "field": "due_date", "align": "left"},
+                {"name": "return", "label": "归还日期", "field": "return_date", "align": "left"},
+                {"name": "status", "label": "状态", "field": "status", "align": "center"},
+            ]
+            rows = []
+            for h in history:
+                from components.status_badge import BORROW_STATUS
+                status_label = BORROW_STATUS.get(h["status"], (h["status"],))[0]
+                rows.append({
+                    "user_name": h.get("user_name", ""),
+                    "borrow_date": h.get("borrow_date", "")[:10],
+                    "due_date": h.get("due_date", ""),
+                    "return_date": (h.get("return_date") or "未归还")[:10],
+                    "status": status_label,
+                })
+            ui.table(columns=columns, rows=rows, row_key="borrow_date").classes("w-full")
+        else:
+            ui.label("暂无借用记录").classes("text-grey")
+
+
+def _go_login(item_id: int):
+    """跳转登录并记住回跳地址"""
+    app.storage.user["redirect"] = f"/items/{item_id}"
+    ui.navigate.to("/login")
+
+
+def _info_row(label: str, value: str):
+    with ui.row().classes("items-center gap-2"):
+        ui.label(f"{label}:").classes("text-bold w-20")
+        ui.label(str(value))
+
+
+def _show_borrow_dialog(item_id: int):
+    with ui.dialog() as dialog, ui.card().classes("w-96"):
+        ui.label("借用物品").classes("text-h6")
+        due_date = ui.input("预计归还日期", placeholder="YYYY-MM-DD").classes("full-width").props("outlined")
+        purpose = ui.input("借用用途").classes("full-width").props("outlined")
+        msg = ui.label("").classes("text-red")
+
+        with ui.row().classes("full-width justify-end gap-2"):
+            ui.button("取消", on_click=dialog.close).props("flat")
+
+            def do_borrow():
+                if not due_date.value:
+                    msg.text = "请填写归还日期"
+                    return
+                result = api.borrow_item(item_id, due_date.value, purpose.value or "")
+                if result.get("code") == 0:
+                    dialog.close()
+                    ui.notify("借用成功！", type="positive")
+                    ui.navigate.to(f"/items/{item_id}")
+                else:
+                    msg.text = result.get("msg", "借用失败")
+
+            ui.button("确认借用", on_click=do_borrow).props("color=blue")
+    dialog.open()
+
+
+def _show_scrap_dialog(item_id: int):
+    with ui.dialog() as dialog, ui.card().classes("w-96"):
+        ui.label("申请报废").classes("text-h6")
+        reason = ui.textarea("报废原因").classes("full-width").props("outlined")
+        msg = ui.label("").classes("text-red")
+
+        with ui.row().classes("full-width justify-end gap-2"):
+            ui.button("取消", on_click=dialog.close).props("flat")
+
+            def do_scrap():
+                if not reason.value:
+                    msg.text = "请填写报废原因"
+                    return
+                result = api.apply_scrap(item_id, reason.value)
+                if result.get("code") == 0:
+                    dialog.close()
+                    ui.notify("报废申请已提交", type="positive")
+                    ui.navigate.to(f"/items/{item_id}")
+                else:
+                    msg.text = result.get("msg", "申请失败")
+
+            ui.button("确认申请", on_click=do_scrap).props("color=red")
+    dialog.open()
+
+============================================================
+frontend/pages/items.py
+============================================================
+"""物品列表页"""
+from nicegui import ui, app
+from api_client import api
+from components.navbar import navbar
+from components.status_badge import ITEM_STATUS
+
+
+@ui.page("/items")
+def items_page():
+    if not app.storage.user.get("user") or not app.storage.user.get("session_id"):
+        ui.navigate.to("/login")
+        return
+
+    navbar()
+    user = app.storage.user["user"]
+    is_admin = user.get("role") == "admin"
+
+    with ui.column().classes("q-pa-md w-full max-w-6xl mx-auto"):
+        # 标题 + 操作按钮
+        with ui.row().classes("w-full items-center justify-between"):
+            ui.label("物品管理").classes("text-h5")
+            if is_admin:
+                ui.button("录入物品", icon="add", on_click=lambda: ui.navigate.to("/items/create")).props("color=blue")
+
+        # 搜索栏
+        with ui.row().classes("w-full gap-2 q-mt-md"):
+            keyword_input = ui.input("搜索关键词", placeholder="名称或编号").classes("flex-1").props("outlined dense")
+            status_select = ui.select(
+                {"": "全部状态", "available": "可用", "borrowed": "已借出", "pending_scrap": "待报废", "scrapped": "已报废"},
+                value="",
+            ).classes("w-40").props("outlined dense")
+            search_btn = ui.button("搜索", icon="search").props("color=blue")
+
+        # 表格容器
+        table_container = ui.column().classes("w-full q-mt-md")
+
+        def load_items(page=1):
+            table_container.clear()
+            params = {"page": page, "page_size": 20}
+            if keyword_input.value:
+                params["keyword"] = keyword_input.value
+            if status_select.value:
+                params["status"] = status_select.value
+
+            try:
+                result = api.list_items(**params)
+                if result.get("code") != 0:
+                    with table_container:
+                        ui.label(f"加载失败: {result.get('msg')}").classes("text-red")
+                    return
+
+                data = result["data"]
+                items = data.get("items", [])
+                total = data.get("total", 0)
+
+                with table_container:
+                    if not items:
+                        ui.label("暂无物品").classes("text-grey text-center q-pa-lg")
+                        return
+
+                    # 表格
+                    columns = [
+                        {"name": "code", "label": "编号", "field": "code", "align": "left"},
+                        {"name": "name", "label": "名称", "field": "name", "align": "left"},
+                        {"name": "category", "label": "分类", "field": "category_name", "align": "left"},
+                        {"name": "status", "label": "状态", "field": "status", "align": "center"},
+                        {"name": "location", "label": "位置", "field": "location", "align": "left"},
+                        {"name": "action", "label": "操作", "field": "action", "align": "center"},
+                    ]
+                    rows = []
+                    for item in items:
+                        status_label = ITEM_STATUS.get(item["status"], (item["status"],))[0]
+                        rows.append({
+                            "id": item["id"],
+                            "code": item["code"],
+                            "name": item["name"],
+                            "category_name": item.get("category_name") or "-",
+                            "status": status_label,
+                            "location": item.get("location") or "-",
+                        })
+
+                    table = ui.table(columns=columns, rows=rows, row_key="id").classes("w-full")
+                    table.add_slot("body-cell-action", '''
+                        <q-td :props="props">
+                            <q-btn flat dense color="blue" icon="visibility" @click="$parent.$emit('view', props.row)" />
+                        </q-td>
+                    ''')
+                    table.on("view", lambda e: ui.navigate.to(f"/items/{e.args['id']}"))
+
+                    # 分页
+                    total_pages = (total + 19) // 20
+                    if total_pages > 1:
+                        with ui.row().classes("w-full justify-center q-mt-md"):
+                            for p in range(1, total_pages + 1):
+                                btn = ui.button(str(p), on_click=lambda _, pg=p: load_items(pg))
+                                if p == page:
+                                    btn.props("color=blue")
+                                else:
+                                    btn.props("flat")
+
+            except Exception as e:
+                with table_container:
+                    ui.label(f"请求失败: {e}").classes("text-red")
+
+        search_btn.on_click(lambda: load_items())
+        load_items()
+
+============================================================
+frontend/pages/login.py
+============================================================
+"""登录页"""
+from nicegui import ui, app
+from api_client import api
+
+
+@ui.page("/login")
+@ui.page("/")
+def login_page():
+    # 已登录则跳转仪表盘
+    if app.storage.user.get("user"):
+        ui.navigate.to("/dashboard")
+        return
+
+    with ui.column().classes("absolute-center items-center"):
+        ui.label("📦 学校物品二维码管理系统").classes("text-h4 text-blue-8 q-mb-lg")
+
+        with ui.card().classes("w-80 q-pa-lg"):
+            ui.label("登录").classes("text-h5 text-center q-mb-md")
+
+            username = ui.input("用户名", placeholder="请输入用户名").classes("full-width").props("outlined")
+            password = ui.input("密码", placeholder="请输入密码", password=True, password_toggle_button=True).classes("full-width").props("outlined")
+            msg = ui.label("").classes("text-red text-center")
+
+            async def do_login():
+                if not username.value or not password.value:
+                    msg.text = "请输入用户名和密码"
+                    return
+                msg.text = ""
+                try:
+                    result = api.login(username.value, password.value)
+                    if result.get("code") == 0:
+                        app.storage.user["user"] = result["data"]
+                        # 登录后跳转回之前的页面（扫码场景）
+                        redirect = app.storage.user.pop("redirect", None)
+                        ui.navigate.to(redirect or "/dashboard")
+                    else:
+                        msg.text = result.get("msg", "登录失败")
+                except Exception as e:
+                    msg.text = f"连接后端失败: {e}"
+
+            ui.button("登 录", on_click=do_login, icon="login").classes("full-width q-mt-md").props("color=blue-8")
+            password.on("keydown.enter", do_login)
+
+        with ui.row().classes("q-mt-md text-grey"):
+            ui.label("测试账号: admin/admin123  teacher1/teacher1  student1/student1").classes("text-caption")
+
+============================================================
+frontend/pages/my_borrows.py
+============================================================
+"""我的借用页"""
+from nicegui import ui, app
+from api_client import api
+from components.navbar import navbar
+from components.status_badge import BORROW_STATUS
+
+
+@ui.page("/my-borrows")
+def my_borrows_page():
+    if not app.storage.user.get("user") or not app.storage.user.get("session_id"):
+        ui.navigate.to("/login")
+        return
+
+    navbar()
+
+    with ui.column().classes("q-pa-md w-full max-w-6xl mx-auto"):
+        ui.label("我的借用").classes("text-h5")
+
+        # 筛选
+        with ui.row().classes("w-full gap-2 q-mt-md"):
+            status_select = ui.select(
+                {"": "全部", "active": "借用中", "returned": "已归还", "overdue": "逾期"},
+                value="",
+            ).classes("w-40").props("outlined dense")
+            search_btn = ui.button("筛选", icon="filter_list").props("color=blue")
+
+        table_container = ui.column().classes("w-full q-mt-md")
+
+        def load_my_borrows(page=1):
+            table_container.clear()
+            params = {"page": page, "page_size": 20}
+            if status_select.value:
+                params["status"] = status_select.value
+
+            try:
+                result = api.my_borrows(**params)
+                if result.get("code") != 0:
+                    with table_container:
+                        ui.label(f"加载失败: {result.get('msg')}").classes("text-red")
+                    return
+
+                data = result["data"]
+                records = data.get("items", [])
+                total = data.get("total", 0)
+
+                with table_container:
+                    if not records:
+                        ui.label("暂无借用记录").classes("text-grey text-center q-pa-lg")
+                        return
+
+                    columns = [
+                        {"name": "item_code", "label": "物品编号", "field": "item_code", "align": "left"},
+                        {"name": "item_name", "label": "物品名称", "field": "item_name", "align": "left"},
+                        {"name": "borrow_date", "label": "借出日期", "field": "borrow_date", "align": "left"},
+                        {"name": "due_date", "label": "应还日期", "field": "due_date", "align": "left"},
+                        {"name": "return_date", "label": "归还日期", "field": "return_date", "align": "left"},
+                        {"name": "status", "label": "状态", "field": "status_label", "align": "center"},
+                        {"name": "action", "label": "操作", "field": "action", "align": "center"},
+                    ]
+                    rows = []
+                    for r in records:
+                        status_label = BORROW_STATUS.get(r["status"], (r["status"],))[0]
+                        rows.append({
+                            "id": r["id"],
+                            "item_id": r["item_id"],
+                            "item_code": r.get("item_code", ""),
+                            "item_name": r.get("item_name", ""),
+                            "borrow_date": r.get("borrow_date", "")[:10],
+                            "due_date": str(r.get("due_date", "")),
+                            "return_date": (r.get("return_date") or "")[:10] or "未归还",
+                            "status": r["status"],
+                            "status_label": status_label,
+                        })
+
+                    table = ui.table(columns=columns, rows=rows, row_key="id").classes("w-full")
+                    table.add_slot("body-cell-action", '''
+                        <q-td :props="props">
+                            <q-btn v-if="props.row.status === 'active' || props.row.status === 'overdue'"
+                                   flat dense color="green" label="归还"
+                                   @click="$parent.$emit('return_item', props.row)" />
+                            <q-btn flat dense color="blue" icon="visibility"
+                                   @click="$parent.$emit('view_item', props.row)" />
+                        </q-td>
+                    ''')
+                    table.on("return_item", lambda e: _show_return_dialog(e.args["id"], load_my_borrows))
+                    table.on("view_item", lambda e: ui.navigate.to(f"/items/{e.args['item_id']}"))
+
+                    # 分页
+                    total_pages = (total + 19) // 20
+                    if total_pages > 1:
+                        with ui.row().classes("w-full justify-center q-mt-md"):
+                            for p in range(1, total_pages + 1):
+                                btn = ui.button(str(p), on_click=lambda _, pg=p: load_my_borrows(pg))
+                                if p == page:
+                                    btn.props("color=blue")
+                                else:
+                                    btn.props("flat")
+
+            except Exception as e:
+                with table_container:
+                    ui.label(f"请求失败: {e}").classes("text-red")
+
+        search_btn.on_click(lambda: load_my_borrows())
+        load_my_borrows()
+
+
+def _show_return_dialog(borrow_id: int, reload_fn):
+    with ui.dialog() as dialog, ui.card().classes("w-96"):
+        ui.label("归还物品").classes("text-h6")
+        return_note = ui.input("物品状况备注", placeholder="如：完好无损").classes("full-width").props("outlined")
+        msg = ui.label("").classes("text-red")
+
+        with ui.row().classes("full-width justify-end gap-2"):
+            ui.button("取消", on_click=dialog.close).props("flat")
+
+            def do_return():
+                result = api.return_item(borrow_id, return_note.value or "")
+                if result.get("code") == 0:
+                    dialog.close()
+                    ui.notify("归还成功！", type="positive")
+                    reload_fn()
+                else:
+                    msg.text = result.get("msg", "归还失败")
+
+            ui.button("确认归还", on_click=do_return).props("color=green")
+    dialog.open()
+
+============================================================
+frontend/pages/scraps.py
+============================================================
+"""报废管理页"""
+from nicegui import ui, app
+from api_client import api
+from components.navbar import navbar
+from components.status_badge import SCRAP_STATUS
+
+
+@ui.page("/scraps")
+def scraps_page():
+    if not app.storage.user.get("user") or not app.storage.user.get("session_id"):
+        ui.navigate.to("/login")
+        return
+
+    navbar()
+    user = app.storage.user["user"]
+    is_admin = user.get("role") == "admin"
+
+    with ui.column().classes("q-pa-md w-full max-w-6xl mx-auto"):
+        ui.label("报废管理").classes("text-h5")
+
+        # 筛选
+        with ui.row().classes("w-full gap-2 q-mt-md"):
+            status_select = ui.select(
+                {"": "全部", "pending": "待审批", "approved": "已通过", "rejected": "已驳回"},
+                value="",
+            ).classes("w-40").props("outlined dense")
+            search_btn = ui.button("筛选", icon="filter_list").props("color=blue")
+
+        table_container = ui.column().classes("w-full q-mt-md")
+
+        def load_scraps(page=1):
+            table_container.clear()
+            params = {"page": page, "page_size": 20}
+            if status_select.value:
+                params["status"] = status_select.value
+
+            try:
+                result = api.list_scraps(**params)
+                if result.get("code") != 0:
+                    with table_container:
+                        ui.label(f"加载失败: {result.get('msg')}").classes("text-red")
+                    return
+
+                data = result["data"]
+                records = data.get("items", [])
+                total = data.get("total", 0)
+
+                with table_container:
+                    if not records:
+                        ui.label("暂无报废记录").classes("text-grey text-center q-pa-lg")
+                        return
+
+                    columns = [
+                        {"name": "item_code", "label": "物品编号", "field": "item_code", "align": "left"},
+                        {"name": "item_name", "label": "物品名称", "field": "item_name", "align": "left"},
+                        {"name": "applicant", "label": "申请人", "field": "applicant_name", "align": "left"},
+                        {"name": "reason", "label": "报废原因", "field": "reason", "align": "left"},
+                        {"name": "apply_time", "label": "申请时间", "field": "apply_time", "align": "left"},
+                        {"name": "status", "label": "状态", "field": "status_label", "align": "center"},
+                    ]
+
+                    if is_admin:
+                        columns.append({"name": "action", "label": "操作", "field": "action", "align": "center"})
+
+                    rows = []
+                    for r in records:
+                        status_label = SCRAP_STATUS.get(r["status"], (r["status"],))[0]
+                        rows.append({
+                            "id": r["id"],
+                            "item_code": r.get("item_code", ""),
+                            "item_name": r.get("item_name", ""),
+                            "applicant_name": r.get("applicant_name", ""),
+                            "reason": r.get("reason", "")[:30],
+                            "apply_time": r.get("apply_time", "")[:16],
+                            "status": r["status"],
+                            "status_label": status_label,
+                        })
+
+                    table = ui.table(columns=columns, rows=rows, row_key="id").classes("w-full")
+
+                    if is_admin:
+                        table.add_slot("body-cell-action", '''
+                            <q-td :props="props">
+                                <q-btn v-if="props.row.status === 'pending'"
+                                       flat dense color="green" label="通过"
+                                       @click="$parent.$emit('approve', props.row)" class="q-mr-xs" />
+                                <q-btn v-if="props.row.status === 'pending'"
+                                       flat dense color="red" label="驳回"
+                                       @click="$parent.$emit('reject', props.row)" />
+                            </q-td>
+                        ''')
+                        table.on("approve", lambda e: _show_approve_dialog(e.args["id"], True, load_scraps))
+                        table.on("reject", lambda e: _show_approve_dialog(e.args["id"], False, load_scraps))
+
+                    # 分页
+                    total_pages = (total + 19) // 20
+                    if total_pages > 1:
+                        with ui.row().classes("w-full justify-center q-mt-md"):
+                            for p in range(1, total_pages + 1):
+                                btn = ui.button(str(p), on_click=lambda _, pg=p: load_scraps(pg))
+                                if p == page:
+                                    btn.props("color=blue")
+                                else:
+                                    btn.props("flat")
+
+            except Exception as e:
+                with table_container:
+                    ui.label(f"请求失败: {e}").classes("text-red")
+
+        search_btn.on_click(lambda: load_scraps())
+        load_scraps()
+
+
+def _show_approve_dialog(scrap_id: int, is_approve: bool, reload_fn):
+    title = "审批通过" if is_approve else "审批驳回"
+    color = "green" if is_approve else "red"
+
+    with ui.dialog() as dialog, ui.card().classes("w-96"):
+        ui.label(title).classes("text-h6")
+        note = ui.input("审批备注", placeholder="如：确认报废 / 建议先维修").classes("full-width").props("outlined")
+        msg = ui.label("").classes("text-red")
+
+        with ui.row().classes("full-width justify-end gap-2"):
+            ui.button("取消", on_click=dialog.close).props("flat")
+
+            def do_action():
+                if is_approve:
+                    result = api.approve_scrap(scrap_id, note.value or "")
+                else:
+                    result = api.reject_scrap(scrap_id, note.value or "")
+
+                if result.get("code") == 0:
+                    dialog.close()
+                    ui.notify(f"{title}成功", type="positive")
+                    reload_fn()
+                else:
+                    msg.text = result.get("msg", "操作失败")
+
+            ui.button("确认", on_click=do_action).props(f"color={color}")
+    dialog.open()
+
+============================================================
+frontend/pages/users.py
+============================================================
+"""用户管理页（Admin only）"""
+from nicegui import ui, app
+from api_client import api
+from components.navbar import navbar
+
+
+ROLE_LABELS = {"admin": "管理员", "staff": "教职工", "student": "学生"}
+
+
+@ui.page("/users")
+def users_page():
+    if not app.storage.user.get("user") or not app.storage.user.get("session_id"):
+        ui.navigate.to("/login")
+        return
+
+    user = app.storage.user["user"]
+    if user.get("role") != "admin":
+        ui.navigate.to("/dashboard")
+        return
+
+    navbar()
+
+    with ui.column().classes("q-pa-md w-full max-w-6xl mx-auto"):
+        with ui.row().classes("w-full items-center justify-between"):
+            ui.label("用户管理").classes("text-h5")
+            ui.button("添加用户", icon="person_add", on_click=lambda: _show_create_dialog(load_users)).props("color=blue")
+
+        table_container = ui.column().classes("w-full q-mt-md")
+
+        def load_users(page=1):
+            table_container.clear()
+
+            try:
+                result = api.list_users(page=page, page_size=20)
+                if result.get("code") != 0:
+                    with table_container:
+                        ui.label(f"加载失败: {result.get('msg')}").classes("text-red")
+                    return
+
+                data = result["data"]
+                users = data.get("items", [])
+                total = data.get("total", 0)
+
+                with table_container:
+                    if not users:
+                        ui.label("暂无用户").classes("text-grey text-center q-pa-lg")
+                        return
+
+                    columns = [
+                        {"name": "username", "label": "用户名", "field": "username", "align": "left"},
+                        {"name": "real_name", "label": "姓名", "field": "real_name", "align": "left"},
+                        {"name": "role", "label": "角色", "field": "role_label", "align": "center"},
+                        {"name": "phone", "label": "电话", "field": "phone", "align": "left"},
+                        {"name": "is_active", "label": "状态", "field": "active_label", "align": "center"},
+                        {"name": "action", "label": "操作", "field": "action", "align": "center"},
+                    ]
+                    rows = []
+                    for u in users:
+                        rows.append({
+                            "id": u["id"],
+                            "username": u["username"],
+                            "real_name": u["real_name"],
+                            "role": u["role"],
+                            "role_label": ROLE_LABELS.get(u["role"], u["role"]),
+                            "phone": u.get("phone") or "-",
+                            "is_active": u.get("is_active", True),
+                            "active_label": "启用" if u.get("is_active", True) else "已禁用",
+                        })
+
+                    table = ui.table(columns=columns, rows=rows, row_key="id").classes("w-full")
+                    table.add_slot("body-cell-action", '''
+                        <q-td :props="props">
+                            <q-btn flat dense color="blue" label="编辑"
+                                   @click="$parent.$emit('edit', props.row)" class="q-mr-xs" />
+                            <q-btn v-if="props.row.is_active"
+                                   flat dense color="red" label="禁用"
+                                   @click="$parent.$emit('disable', props.row)" />
+                        </q-td>
+                    ''')
+                    table.on("edit", lambda e: _show_edit_dialog(e.args, load_users))
+                    table.on("disable", lambda e: _do_disable(e.args["id"], load_users))
+
+                    # 分页
+                    total_pages = (total + 19) // 20
+                    if total_pages > 1:
+                        with ui.row().classes("w-full justify-center q-mt-md"):
+                            for p in range(1, total_pages + 1):
+                                btn = ui.button(str(p), on_click=lambda _, pg=p: load_users(pg))
+                                if p == page:
+                                    btn.props("color=blue")
+                                else:
+                                    btn.props("flat")
+
+            except Exception as e:
+                with table_container:
+                    ui.label(f"请求失败: {e}").classes("text-red")
+
+        load_users()
+
+
+def _show_create_dialog(reload_fn):
+    with ui.dialog() as dialog, ui.card().classes("w-96"):
+        ui.label("添加用户").classes("text-h6")
+        username = ui.input("用户名 *").classes("full-width").props("outlined")
+        password = ui.input("密码 *", password=True).classes("full-width").props("outlined")
+        real_name = ui.input("真实姓名 *").classes("full-width").props("outlined")
+        role = ui.select({"student": "学生", "staff": "教职工", "admin": "管理员"}, value="student", label="角色").classes("full-width").props("outlined")
+        phone = ui.input("电话").classes("full-width").props("outlined")
+        msg = ui.label("").classes("text-red")
+
+        with ui.row().classes("full-width justify-end gap-2"):
+            ui.button("取消", on_click=dialog.close).props("flat")
+
+            def do_create():
+                if not username.value or not password.value or not real_name.value:
+                    msg.text = "请填写必填项"
+                    return
+                data = {
+                    "username": username.value,
+                    "password": password.value,
+                    "real_name": real_name.value,
+                    "role": role.value,
+                }
+                if phone.value:
+                    data["phone"] = phone.value
+
+                result = api.create_user(data)
+                if result.get("code") == 0:
+                    dialog.close()
+                    ui.notify("用户创建成功", type="positive")
+                    reload_fn()
+                else:
+                    msg.text = result.get("msg", "创建失败")
+
+            ui.button("创建", on_click=do_create).props("color=blue")
+    dialog.open()
+
+
+def _show_edit_dialog(user_data: dict, reload_fn):
+    user_id = user_data["id"]
+    with ui.dialog() as dialog, ui.card().classes("w-96"):
+        ui.label("编辑用户").classes("text-h6")
+        ui.label(f"用户名: {user_data['username']}").classes("text-grey")
+        real_name = ui.input("真实姓名", value=user_data["real_name"]).classes("full-width").props("outlined")
+        role = ui.select(
+            {"student": "学生", "staff": "教职工", "admin": "管理员"},
+            value=user_data["role"],
+            label="角色",
+        ).classes("full-width").props("outlined")
+        phone = ui.input("电话", value=user_data.get("phone") or "").classes("full-width").props("outlined")
+        msg = ui.label("").classes("text-red")
+
+        with ui.row().classes("full-width justify-end gap-2"):
+            ui.button("取消", on_click=dialog.close).props("flat")
+
+            def do_update():
+                data = {}
+                if real_name.value:
+                    data["real_name"] = real_name.value
+                if role.value:
+                    data["role"] = role.value
+                if phone.value:
+                    data["phone"] = phone.value
+
+                result = api.update_user(user_id, data)
+                if result.get("code") == 0:
+                    dialog.close()
+                    ui.notify("用户更新成功", type="positive")
+                    reload_fn()
+                else:
+                    msg.text = result.get("msg", "更新失败")
+
+            ui.button("保存", on_click=do_update).props("color=blue")
+    dialog.open()
+
+
+def _do_disable(user_id: int, reload_fn):
+    result = api.disable_user(user_id)
+    if result.get("code") == 0:
+        ui.notify("用户已禁用", type="warning")
+        reload_fn()
+    else:
+        ui.notify(result.get("msg", "操作失败"), type="negative")
+

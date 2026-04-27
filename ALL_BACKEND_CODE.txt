@@ -1,0 +1,5899 @@
+============================================================
+requirements.txt
+============================================================
+# 后端
+fastapi>=0.110
+uvicorn>=0.29
+sqlalchemy>=2.0
+pydantic>=2.0
+qrcode[pil]>=7.4
+reportlab>=4.0
+apscheduler>=3.10
+python-multipart>=0.0.9
+
+# 前端
+nicegui>=2.0
+httpx>=0.27
+
+============================================================
+README.md
+============================================================
+# 学校物品二维码管理系统
+
+物品录入 → 借出 → 归还 → 报废 全生命周期管理
+
+---
+
+## 本地启动后端
+
+### 1. 安装依赖
+
+```bash
+cd school-qrcode-system
+pip install -r requirements.txt
+```
+
+### 2. 初始化数据库（首次运行）
+
+```bash
+cd backend
+python init_db.py
+```
+
+默认创建以下测试账号：
+
+| 用户名    | 密码      | 角色    |
+|-----------|-----------|---------|
+| admin     | admin123  | 管理员  |
+| teacher1  | teacher1  | 教职工  |
+| student1  | student1  | 学生    |
+
+### 3. 启动后端
+
+```bash
+cd backend
+python main.py
+```
+
+默认端口 **8000**，API 文档：http://localhost:8000/docs
+
+### 4. 使用自定义端口
+
+通过环境变量设置：
+
+```bash
+# macOS / Linux
+API_PORT=9090 python main.py
+
+# 或者 export
+export API_PORT=9090
+python main.py
+```
+
+### 5. 所有可配置环境变量
+
+| 变量名         | 默认值                          | 说明                        |
+|----------------|--------------------------------|-----------------------------|
+| API_PORT       | 8000                           | 后端 API 端口               |
+| DB_PATH        | data/school_qr.db              | SQLite 数据库文件路径        |
+| SESSION_SECRET | dev-secret-change-in-prod      | Session 签名密钥             |
+| SERVER_HOST    | localhost:8080                  | 二维码中的前端地址           |
+| STATIC_DIR     | static                         | 静态文件目录（二维码/PDF）   |
+
+### 6. 验证后端运行
+
+```bash
+# 健康检查
+curl http://localhost:8000/
+
+# 登录（获取 session cookie）
+curl -c cookies.txt -X POST http://localhost:8000/api/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"admin","password":"admin123"}'
+
+# 查看物品列表（带 cookie）
+curl -b cookies.txt http://localhost:8000/api/items
+
+# 查看仪表盘统计
+curl -b cookies.txt http://localhost:8000/api/dashboard/stats
+```
+
+---
+
+## 启动前端
+
+```bash
+cd frontend
+python main.py
+```
+
+默认端口 **8080**，打开浏览器访问：http://localhost:8080
+
+自定义端口：
+
+```bash
+FRONTEND_PORT=9091 python main.py
+```
+
+> 注意：前端需要后端先启动。默认连接 http://localhost:8000/api
+> 如需修改后端地址：`API_BASE_URL=http://localhost:9090/api python main.py`
+
+---
+
+## 项目结构
+
+```
+school-qrcode-system/
+├── docs/                  # 设计文档
+├── backend/               # FastAPI 后端
+│   ├── main.py            # 入口
+│   ├── config.py          # 配置
+│   ├── database.py        # SQLAlchemy 引擎
+│   ├── init_db.py         # 建表 + 种子数据
+│   ├── models/            # ORM 模型
+│   ├── schemas/           # Pydantic 请求/响应
+│   ├── services/          # 业务逻辑
+│   ├── routers/           # API 路由
+│   └── utils/             # 认证 & 依赖注入
+├── frontend/              # NiceGUI 前端（待实现）
+└── requirements.txt
+```
+
+============================================================
+ALL_FRONTEND_CODE.md
+============================================================
+# School QR Code System — Frontend Complete Code
+
+Total files: 15
+
+---
+
+## `frontend/api_client.py`
+
+```python
+"""封装后端 API 调用 — 每次请求从 NiceGUI app.storage.user 读 session_id"""
+import os
+import httpx
+from nicegui import app
+
+API_BASE = os.getenv("API_BASE_URL", "http://localhost:8000/api")
+
+
+def _get_session_id() -> str | None:
+    """从 NiceGUI 用户存储读取 session_id"""
+    try:
+        return app.storage.user.get("session_id")
+    except Exception:
+        return None
+
+
+def _cookies() -> dict:
+    """构造 Cookie dict"""
+    sid = _get_session_id()
+    return {"session_id": sid} if sid else {}
+
+
+def _post(path: str, **kwargs) -> dict:
+    with httpx.Client(base_url=API_BASE, timeout=30) as c:
+        resp = c.post(path, cookies=_cookies(), **kwargs)
+        return resp.json()
+
+
+def _get(path: str, **kwargs) -> dict:
+    with httpx.Client(base_url=API_BASE, timeout=30) as c:
+        resp = c.get(path, cookies=_cookies(), **kwargs)
+        return resp.json()
+
+
+def _put(path: str, **kwargs) -> dict:
+    with httpx.Client(base_url=API_BASE, timeout=30) as c:
+        resp = c.put(path, cookies=_cookies(), **kwargs)
+        return resp.json()
+
+
+def _delete(path: str, **kwargs) -> dict:
+    with httpx.Client(base_url=API_BASE, timeout=30) as c:
+        resp = c.delete(path, cookies=_cookies(), **kwargs)
+        return resp.json()
+
+
+class ApiClient:
+
+    # ---------- 认证 ----------
+    def login(self, username: str, password: str) -> dict:
+        """登录 — 特殊处理：需要从 response 提取 session_id cookie"""
+        with httpx.Client(base_url=API_BASE, timeout=30) as c:
+            resp = c.post("/auth/login", json={"username": username, "password": password})
+            data = resp.json()
+            # 把后端返回的 session_id cookie 存到 NiceGUI user storage
+            sid = resp.cookies.get("session_id")
+            if sid:
+                app.storage.user["session_id"] = sid
+            return data
+
+    def logout(self) -> dict:
+        result = _post("/auth/logout")
+        try:
+            app.storage.user.pop("session_id", None)
+        except Exception:
+            pass
+        return result
+
+    def get_me(self) -> dict:
+        return _get("/auth/me")
+
+    # ---------- 物品 ----------
+    def list_items(self, **params) -> dict:
+        return _get("/items", params=params)
+
+    def get_item(self, item_id: int) -> dict:
+        return _get(f"/items/{item_id}")
+
+    def create_item(self, data: dict) -> dict:
+        return _post("/items", json=data)
+
+    def update_item(self, item_id: int, data: dict) -> dict:
+        return _put(f"/items/{item_id}", json=data)
+
+    def delete_item(self, item_id: int) -> dict:
+        return _delete(f"/items/{item_id}")
+
+    def get_categories(self) -> dict:
+        return _get("/items/categories")
+
+    def get_qrcode_url(self, item_id: int) -> str:
+        """返回二维码图片的完整 URL（含 session cookie 无法直接用，走代理）"""
+        return f"{API_BASE.replace('/api', '')}/api/items/{item_id}/qrcode"
+
+    # ---------- 借用 ----------
+    def borrow_item(self, item_id: int, due_date: str, purpose: str = "") -> dict:
+        return _post("/borrows", json={
+            "item_id": item_id, "due_date": due_date, "purpose": purpose,
+        })
+
+    def return_item(self, borrow_id: int, return_note: str = "") -> dict:
+        return _put(f"/borrows/{borrow_id}/return", json={"return_note": return_note})
+
+    def list_borrows(self, **params) -> dict:
+        return _get("/borrows", params=params)
+
+    def my_borrows(self, **params) -> dict:
+        return _get("/borrows/my", params=params)
+
+    def list_overdue(self) -> dict:
+        return _get("/borrows/overdue")
+
+    # ---------- 报废 ----------
+    def apply_scrap(self, item_id: int, reason: str) -> dict:
+        return _post("/scraps", json={"item_id": item_id, "reason": reason})
+
+    def approve_scrap(self, scrap_id: int, note: str = "") -> dict:
+        return _put(f"/scraps/{scrap_id}/approve", json={"approve_note": note})
+
+    def reject_scrap(self, scrap_id: int, note: str = "") -> dict:
+        return _put(f"/scraps/{scrap_id}/reject", json={"approve_note": note})
+
+    def list_scraps(self, **params) -> dict:
+        return _get("/scraps", params=params)
+
+    # ---------- 用户 ----------
+    def list_users(self, **params) -> dict:
+        return _get("/users", params=params)
+
+    def create_user(self, data: dict) -> dict:
+        return _post("/users", json=data)
+
+    def update_user(self, user_id: int, data: dict) -> dict:
+        return _put(f"/users/{user_id}", json=data)
+
+    def disable_user(self, user_id: int) -> dict:
+        return _put(f"/users/{user_id}/disable")
+
+    # ---------- 仪表盘 ----------
+    def get_stats(self) -> dict:
+        return _get("/dashboard/stats")
+
+    def get_top_borrowed(self, limit: int = 10) -> dict:
+        return _get("/dashboard/top-borrowed", params={"limit": limit})
+
+
+# 全局单例
+api = ApiClient()
+
+```
+
+---
+
+## `frontend/main.py`
+
+```python
+"""NiceGUI 前端入口"""
+import os
+from nicegui import ui, app
+
+# 全局状态：当前登录用户信息
+# 存储在 app.storage.user 中（NiceGUI 自带 per-user storage）
+
+FRONTEND_PORT = int(os.getenv("FRONTEND_PORT", "8080"))
+
+
+def init_routes():
+    """注册所有页面路由"""
+    from pages.login import login_page
+    from pages.dashboard import dashboard_page
+    from pages.items import items_page
+    from pages.item_create import item_create_page      # 固定路径必须在动态路径之前
+    from pages.item_detail import item_detail_page
+    from pages.borrows import borrows_page
+    from pages.my_borrows import my_borrows_page
+    from pages.scraps import scraps_page
+    from pages.users import users_page
+
+
+init_routes()
+
+ui.run(
+    title="学校物品二维码管理系统",
+    port=FRONTEND_PORT,
+    storage_secret="school-qr-storage-secret",
+    dark=False,
+)
+
+```
+
+---
+
+## `frontend/components/__init__.py`
+
+```python
+
+```
+
+---
+
+## `frontend/components/navbar.py`
+
+```python
+"""顶部导航栏组件"""
+from nicegui import ui, app
+from api_client import api
+
+
+def navbar():
+    """渲染顶部导航栏，根据用户角色显示不同菜单"""
+    user = app.storage.user.get("user")
+    if not user:
+        return
+
+    role = user.get("role", "")
+    real_name = user.get("real_name", "")
+
+    with ui.header().classes("bg-blue-8 text-white shadow-2 items-center justify-between"):
+        with ui.row().classes("items-center gap-0"):
+            ui.label("📦 物品管理系统").classes("text-h6 q-mr-md cursor-pointer").on("click", lambda: ui.navigate.to("/dashboard"))
+
+            ui.button("仪表盘", icon="dashboard", on_click=lambda: ui.navigate.to("/dashboard")).props("flat color=white")
+            ui.button("物品管理", icon="inventory_2", on_click=lambda: ui.navigate.to("/items")).props("flat color=white")
+            ui.button("借用管理", icon="swap_horiz", on_click=lambda: ui.navigate.to("/borrows")).props("flat color=white")
+            ui.button("我的借用", icon="person", on_click=lambda: ui.navigate.to("/my-borrows")).props("flat color=white")
+            ui.button("报废管理", icon="delete_forever", on_click=lambda: ui.navigate.to("/scraps")).props("flat color=white")
+
+            if role == "admin":
+                ui.button("用户管理", icon="group", on_click=lambda: ui.navigate.to("/users")).props("flat color=white")
+
+        with ui.row().classes("items-center"):
+            role_labels = {"admin": "管理员", "staff": "教职工", "student": "学生"}
+            ui.badge(role_labels.get(role, role), color="white", text_color="blue-8").classes("q-mr-sm")
+            ui.label(real_name).classes("q-mr-md")
+            ui.button("退出", icon="logout", on_click=_logout).props("flat color=white")
+
+
+async def _logout():
+    """退出登录"""
+    try:
+        api.logout()
+    except Exception:
+        pass
+    app.storage.user.clear()
+    ui.navigate.to("/login")
+
+```
+
+---
+
+## `frontend/components/status_badge.py`
+
+```python
+"""状态标签组件 — 不同状态用不同颜色"""
+from nicegui import ui
+
+
+# 物品状态
+ITEM_STATUS = {
+    "available": ("可用", "green"),
+    "borrowed": ("已借出", "orange"),
+    "pending_scrap": ("待报废", "red"),
+    "scrapped": ("已报废", "grey"),
+}
+
+# 借用状态
+BORROW_STATUS = {
+    "active": ("借用中", "blue"),
+    "returned": ("已归还", "green"),
+    "overdue": ("逾期", "red"),
+}
+
+# 报废状态
+SCRAP_STATUS = {
+    "pending": ("待审批", "orange"),
+    "approved": ("已通过", "green"),
+    "rejected": ("已驳回", "red"),
+}
+
+
+def item_status_badge(status: str):
+    """物品状态标签"""
+    label, color = ITEM_STATUS.get(status, (status, "grey"))
+    ui.badge(label, color=color)
+
+
+def borrow_status_badge(status: str):
+    """借用状态标签"""
+    label, color = BORROW_STATUS.get(status, (status, "grey"))
+    ui.badge(label, color=color)
+
+
+def scrap_status_badge(status: str):
+    """报废状态标签"""
+    label, color = SCRAP_STATUS.get(status, (status, "grey"))
+    ui.badge(label, color=color)
+
+```
+
+---
+
+## `frontend/pages/__init__.py`
+
+```python
+
+```
+
+---
+
+## `frontend/pages/borrows.py`
+
+```python
+"""借用管理页（全部借用记录）"""
+from nicegui import ui, app
+from api_client import api
+from components.navbar import navbar
+from components.status_badge import BORROW_STATUS
+
+
+@ui.page("/borrows")
+def borrows_page():
+    if not app.storage.user.get("user") or not app.storage.user.get("session_id"):
+        ui.navigate.to("/login")
+        return
+
+    navbar()
+    user = app.storage.user["user"]
+    is_admin = user.get("role") == "admin"
+
+    with ui.column().classes("q-pa-md w-full max-w-6xl mx-auto"):
+        ui.label("借用管理").classes("text-h5")
+
+        # 筛选
+        with ui.row().classes("w-full gap-2 q-mt-md"):
+            status_select = ui.select(
+                {"": "全部", "active": "借用中", "returned": "已归还", "overdue": "逾期"},
+                value="",
+            ).classes("w-40").props("outlined dense")
+            search_btn = ui.button("筛选", icon="filter_list").props("color=blue")
+
+        table_container = ui.column().classes("w-full q-mt-md")
+
+        def load_borrows(page=1):
+            table_container.clear()
+            params = {"page": page, "page_size": 20}
+            if status_select.value:
+                params["status"] = status_select.value
+
+            try:
+                result = api.list_borrows(**params)
+                if result.get("code") != 0:
+                    with table_container:
+                        ui.label(f"加载失败: {result.get('msg')}").classes("text-red")
+                    return
+
+                data = result["data"]
+                records = data.get("items", [])
+                total = data.get("total", 0)
+
+                with table_container:
+                    if not records:
+                        ui.label("暂无借用记录").classes("text-grey text-center q-pa-lg")
+                        return
+
+                    columns = [
+                        {"name": "item_code", "label": "物品编号", "field": "item_code", "align": "left"},
+                        {"name": "item_name", "label": "物品名称", "field": "item_name", "align": "left"},
+                        {"name": "user_name", "label": "借用人", "field": "user_name", "align": "left"},
+                        {"name": "borrow_date", "label": "借出日期", "field": "borrow_date", "align": "left"},
+                        {"name": "due_date", "label": "应还日期", "field": "due_date", "align": "left"},
+                        {"name": "status", "label": "状态", "field": "status_label", "align": "center"},
+                        {"name": "action", "label": "操作", "field": "action", "align": "center"},
+                    ]
+                    rows = []
+                    for r in records:
+                        status_label = BORROW_STATUS.get(r["status"], (r["status"],))[0]
+                        rows.append({
+                            "id": r["id"],
+                            "item_id": r["item_id"],
+                            "item_code": r.get("item_code", ""),
+                            "item_name": r.get("item_name", ""),
+                            "user_name": r.get("user_name", ""),
+                            "borrow_date": r.get("borrow_date", "")[:10],
+                            "due_date": str(r.get("due_date", "")),
+                            "status": r["status"],
+                            "status_label": status_label,
+                        })
+
+                    table = ui.table(columns=columns, rows=rows, row_key="id").classes("w-full")
+
+                    # 只有 active/overdue 状态且 (本人或管理员) 才能归还
+                    table.add_slot("body-cell-action", '''
+                        <q-td :props="props">
+                            <q-btn v-if="props.row.status === 'active' || props.row.status === 'overdue'"
+                                   flat dense color="green" label="归还"
+                                   @click="$parent.$emit('return_item', props.row)" />
+                            <q-btn flat dense color="blue" icon="visibility"
+                                   @click="$parent.$emit('view_item', props.row)" />
+                        </q-td>
+                    ''')
+                    table.on("return_item", lambda e: _show_return_dialog(e.args["id"], load_borrows))
+                    table.on("view_item", lambda e: ui.navigate.to(f"/items/{e.args['item_id']}"))
+
+                    # 分页
+                    total_pages = (total + 19) // 20
+                    if total_pages > 1:
+                        with ui.row().classes("w-full justify-center q-mt-md"):
+                            for p in range(1, total_pages + 1):
+                                btn = ui.button(str(p), on_click=lambda _, pg=p: load_borrows(pg))
+                                if p == page:
+                                    btn.props("color=blue")
+                                else:
+                                    btn.props("flat")
+
+            except Exception as e:
+                with table_container:
+                    ui.label(f"请求失败: {e}").classes("text-red")
+
+        search_btn.on_click(lambda: load_borrows())
+        load_borrows()
+
+
+def _show_return_dialog(borrow_id: int, reload_fn):
+    with ui.dialog() as dialog, ui.card().classes("w-96"):
+        ui.label("归还物品").classes("text-h6")
+        return_note = ui.input("物品状况备注", placeholder="如：完好无损").classes("full-width").props("outlined")
+        msg = ui.label("").classes("text-red")
+
+        with ui.row().classes("full-width justify-end gap-2"):
+            ui.button("取消", on_click=dialog.close).props("flat")
+
+            def do_return():
+                result = api.return_item(borrow_id, return_note.value or "")
+                if result.get("code") == 0:
+                    dialog.close()
+                    ui.notify("归还成功！", type="positive")
+                    reload_fn()
+                else:
+                    msg.text = result.get("msg", "归还失败")
+
+            ui.button("确认归还", on_click=do_return).props("color=green")
+    dialog.open()
+
+```
+
+---
+
+## `frontend/pages/dashboard.py`
+
+```python
+"""仪表盘页"""
+from nicegui import ui, app
+from api_client import api
+from components.navbar import navbar
+
+
+@ui.page("/dashboard")
+def dashboard_page():
+    if not app.storage.user.get("user") or not app.storage.user.get("session_id"):
+        ui.navigate.to("/login")
+        return
+
+    navbar()
+
+    with ui.column().classes("q-pa-md w-full max-w-6xl mx-auto"):
+        ui.label("仪表盘").classes("text-h5 q-mb-md")
+
+        # 统计卡片
+        try:
+            result = api.get_stats()
+            stats = result.get("data", {}) if result.get("code") == 0 else {}
+        except Exception:
+            stats = {}
+
+        with ui.row().classes("w-full gap-4"):
+            _stat_card("物品总数", stats.get("total_items", 0), "inventory_2", "blue")
+            _stat_card("可用", stats.get("available_count", 0), "check_circle", "green")
+            _stat_card("在借", stats.get("borrowed_count", 0), "swap_horiz", "orange")
+            _stat_card("逾期", stats.get("overdue_count", 0), "warning", "red")
+            _stat_card("已报废", stats.get("scrapped_count", 0), "delete", "grey")
+
+        # 借用频次 Top 10
+        with ui.row().classes("w-full gap-4 q-mt-lg"):
+            with ui.card().classes("flex-1"):
+                ui.label("📊 借用频次 Top 10").classes("text-h6 q-mb-sm")
+                try:
+                    result = api.get_top_borrowed(limit=10)
+                    top_list = result.get("data", []) if result.get("code") == 0 else []
+                except Exception:
+                    top_list = []
+
+                if top_list:
+                    max_count = max(item["borrow_count"] for item in top_list) if top_list else 1
+                    for item in top_list:
+                        pct = int(item["borrow_count"] / max_count * 100)
+                        with ui.row().classes("w-full items-center gap-2"):
+                            ui.label(item["name"]).classes("w-32 text-right")
+                            ui.linear_progress(value=pct / 100, show_value=False).classes("flex-1").props("color=blue")
+                            ui.label(str(item["borrow_count"])).classes("w-8")
+                else:
+                    ui.label("暂无借用记录").classes("text-grey")
+
+            with ui.card().classes("flex-1"):
+                ui.label("⏰ 快捷操作").classes("text-h6 q-mb-sm")
+                ui.button("物品列表", icon="inventory_2", on_click=lambda: ui.navigate.to("/items")).classes("full-width q-mb-sm")
+                ui.button("录入物品", icon="add_circle", on_click=lambda: ui.navigate.to("/items/create")).classes("full-width q-mb-sm")
+                ui.button("我的借用", icon="person", on_click=lambda: ui.navigate.to("/my-borrows")).classes("full-width q-mb-sm")
+                ui.button("报废管理", icon="delete_forever", on_click=lambda: ui.navigate.to("/scraps")).classes("full-width")
+
+
+def _stat_card(title: str, value: int, icon: str, color: str):
+    """统计卡片"""
+    with ui.card().classes("flex-1 text-center q-pa-md"):
+        ui.icon(icon, size="2em", color=color)
+        ui.label(str(value)).classes(f"text-h4 text-{color}")
+        ui.label(title).classes("text-grey")
+
+```
+
+---
+
+## `frontend/pages/item_create.py`
+
+```python
+"""物品录入页（Admin）"""
+import re
+from nicegui import ui, app
+from api_client import api
+from components.navbar import navbar
+
+
+def _normalize_date(s: str) -> str | None:
+    """把各种日期格式统一为 YYYY-MM-DD"""
+    s = s.strip()
+    if not s:
+        return None
+    # 已经是 YYYY-MM-DD
+    if re.match(r"^\d{4}-\d{2}-\d{2}$", s):
+        return s
+    # YYYYMMDD → YYYY-MM-DD
+    if re.match(r"^\d{8}$", s):
+        return f"{s[:4]}-{s[4:6]}-{s[6:8]}"
+    # YYYY/MM/DD → YYYY-MM-DD
+    if re.match(r"^\d{4}/\d{2}/\d{2}$", s):
+        return s.replace("/", "-")
+    return s  # 原样返回，让后端校验
+
+
+@ui.page("/items/create")
+def item_create_page():
+    if not app.storage.user.get("user") or not app.storage.user.get("session_id"):
+        ui.navigate.to("/login")
+        return
+
+    user = app.storage.user["user"]
+    if user.get("role") != "admin":
+        ui.navigate.to("/items")
+        return
+
+    navbar()
+
+    with ui.column().classes("q-pa-md w-full max-w-3xl mx-auto"):
+        with ui.row().classes("items-center gap-4"):
+            ui.button(icon="arrow_back", on_click=lambda: ui.navigate.to("/items")).props("flat round")
+            ui.label("录入物品").classes("text-h5")
+
+        # 加载分类列表
+        categories = {}
+        try:
+            result = api.get_categories()
+            if result.get("code") == 0:
+                for c in result["data"]:
+                    categories[c["id"]] = c["name"]
+        except Exception:
+            pass
+
+        with ui.card().classes("w-full q-mt-md q-pa-lg"):
+            name = ui.input("物品名称 *", placeholder="如：投影仪").classes("full-width").props("outlined")
+            category = ui.select(categories, label="分类").classes("full-width").props("outlined")
+            model_input = ui.input("型号/规格", placeholder="如：EPSON CB-X06").classes("full-width").props("outlined")
+            with ui.input("购入日期", placeholder="YYYY-MM-DD").classes("full-width").props("outlined") as purchase_date:
+                with ui.menu().props("no-parent-event") as menu:
+                    with ui.date(mask="YYYY-MM-DD").bind_value(purchase_date) as dp:
+                        with ui.row().classes("justify-end"):
+                            ui.button("确定", on_click=menu.close).props("flat")
+                with purchase_date.add_slot("append"):
+                    ui.icon("edit_calendar").on("click", menu.open).classes("cursor-pointer")
+            purchase_price = ui.input("购入价格", placeholder="如：3500.00").classes("full-width").props("outlined type=number")
+            location = ui.input("存放位置", placeholder="如：教学楼A栋 301室").classes("full-width").props("outlined")
+            remark = ui.textarea("备注").classes("full-width").props("outlined")
+
+            msg = ui.label("").classes("text-red q-mt-sm")
+
+            def do_create():
+                if not name.value:
+                    msg.text = "请填写物品名称"
+                    return
+
+                data = {"name": name.value}
+                if category.value:
+                    data["category_id"] = category.value
+                if model_input.value:
+                    data["model"] = model_input.value
+                if purchase_date.value:
+                    d = _normalize_date(purchase_date.value)
+                    if d:
+                        data["purchase_date"] = d
+                if purchase_price.value:
+                    try:
+                        data["purchase_price"] = float(purchase_price.value)
+                    except ValueError:
+                        msg.text = "购入价格格式不正确"
+                        return
+                if location.value:
+                    data["location"] = location.value
+                if remark.value:
+                    data["remark"] = remark.value
+                try:
+                    result = api.create_item(data)
+                    if result.get("code") == 0:
+                        ui.notify("物品录入成功！", type="positive")
+                        item_id = result["data"]["id"]
+                        ui.navigate.to(f"/items/{item_id}")
+                    else:
+                        msg.text = result.get("msg", "录入失败")
+                except Exception as e:
+                    msg.text = f"请求失败: {e}"
+
+            with ui.row().classes("full-width justify-end gap-2 q-mt-md"):
+                ui.button("取消", on_click=lambda: ui.navigate.to("/items")).props("flat")
+                ui.button("确认录入", icon="save", on_click=do_create).props("color=blue")
+
+```
+
+---
+
+## `frontend/pages/item_detail.py`
+
+```python
+"""物品详情页 — 扫码跳转目标（公开可查看，操作需登录）"""
+from nicegui import ui, app
+from api_client import api, _get, API_BASE
+from components.navbar import navbar
+from components.status_badge import item_status_badge, ITEM_STATUS
+
+
+@ui.page("/items/{item_id}")
+def item_detail_page(item_id: int):
+    # 判断是否已登录
+    logged_in = bool(app.storage.user.get("user") and app.storage.user.get("session_id"))
+    user = app.storage.user.get("user") if logged_in else None
+
+    # 已登录显示导航栏
+    if logged_in:
+        navbar()
+
+    with ui.column().classes("q-pa-md w-full max-w-4xl mx-auto"):
+        # 未登录提示条
+        if not logged_in:
+            with ui.card().classes("w-full q-mb-md bg-blue-1"):
+                with ui.row().classes("items-center gap-4"):
+                    ui.icon("info", color="blue").classes("text-h5")
+                    ui.label("您当前未登录，仅可查看物品信息。登录后可借用/归还物品。")
+                    ui.button("去登录", on_click=lambda: _go_login(item_id)).props("color=blue flat")
+
+        try:
+            # 公开接口，不需要 cookie
+            import httpx
+            with httpx.Client(base_url=API_BASE, timeout=30) as c:
+                resp = c.get(f"/items/{item_id}")
+                result = resp.json()
+
+            if result.get("code") != 0:
+                ui.label(f"❌ {result.get('msg', '物品不存在')}").classes("text-h5 text-red")
+                return
+
+            item = result["data"]
+        except Exception as e:
+            ui.label(f"请求失败: {e}").classes("text-red")
+            return
+
+        # 标题行
+        with ui.row().classes("items-center gap-4"):
+            if logged_in:
+                ui.button(icon="arrow_back", on_click=lambda: ui.navigate.to("/items")).props("flat round")
+            ui.label("物品详情").classes("text-h5")
+
+        # 详情卡片
+        with ui.card().classes("w-full q-mt-md q-pa-lg"):
+            with ui.row().classes("w-full gap-8"):
+                # 左侧信息
+                with ui.column().classes("flex-1"):
+                    _info_row("名称", item["name"])
+                    _info_row("编号", item["code"])
+                    with ui.row().classes("items-center gap-2"):
+                        ui.label("状态:").classes("text-bold w-20")
+                        item_status_badge(item["status"])
+                    _info_row("分类", item.get("category_name") or "-")
+                    _info_row("型号", item.get("model") or "-")
+                    _info_row("位置", item.get("location") or "-")
+                    _info_row("购入日期", item.get("purchase_date") or "-")
+                    price = item.get("purchase_price")
+                    _info_row("购入价格", f"¥{price}" if price else "-")
+                    _info_row("备注", item.get("remark") or "-")
+
+                # 右侧二维码
+                with ui.column().classes("items-center"):
+                    ui.label("二维码").classes("text-bold q-mb-sm")
+                    qr_url = api.get_qrcode_url(item_id)
+                    ui.image(qr_url).classes("w-40 h-40")
+
+        # 操作按钮（仅登录用户可见）
+        if logged_in:
+            action_row = ui.row().classes("q-mt-md gap-2")
+            with action_row:
+                if item["status"] == "available":
+                    ui.button("借用此物品", icon="shopping_cart", on_click=lambda: _show_borrow_dialog(item_id)).props("color=blue")
+
+                if item["status"] in ("available", "borrowed"):
+                    ui.button("申请报废", icon="delete_forever", on_click=lambda: _show_scrap_dialog(item_id)).props("color=red outline")
+        else:
+            with ui.row().classes("q-mt-md"):
+                ui.button("登录后借用", icon="login", on_click=lambda: _go_login(item_id)).props("color=blue outline")
+
+        # 借用历史
+        ui.label("📋 借用历史").classes("text-h6 q-mt-lg")
+        history = item.get("borrow_history", [])
+        if history:
+            columns = [
+                {"name": "user", "label": "借用人", "field": "user_name", "align": "left"},
+                {"name": "borrow", "label": "借出日期", "field": "borrow_date", "align": "left"},
+                {"name": "due", "label": "应还日期", "field": "due_date", "align": "left"},
+                {"name": "return", "label": "归还日期", "field": "return_date", "align": "left"},
+                {"name": "status", "label": "状态", "field": "status", "align": "center"},
+            ]
+            rows = []
+            for h in history:
+                from components.status_badge import BORROW_STATUS
+                status_label = BORROW_STATUS.get(h["status"], (h["status"],))[0]
+                rows.append({
+                    "user_name": h.get("user_name", ""),
+                    "borrow_date": h.get("borrow_date", "")[:10],
+                    "due_date": h.get("due_date", ""),
+                    "return_date": (h.get("return_date") or "未归还")[:10],
+                    "status": status_label,
+                })
+            ui.table(columns=columns, rows=rows, row_key="borrow_date").classes("w-full")
+        else:
+            ui.label("暂无借用记录").classes("text-grey")
+
+
+def _go_login(item_id: int):
+    """跳转登录并记住回跳地址"""
+    app.storage.user["redirect"] = f"/items/{item_id}"
+    ui.navigate.to("/login")
+
+
+def _info_row(label: str, value: str):
+    with ui.row().classes("items-center gap-2"):
+        ui.label(f"{label}:").classes("text-bold w-20")
+        ui.label(str(value))
+
+
+def _show_borrow_dialog(item_id: int):
+    with ui.dialog() as dialog, ui.card().classes("w-96"):
+        ui.label("借用物品").classes("text-h6")
+        due_date = ui.input("预计归还日期", placeholder="YYYY-MM-DD").classes("full-width").props("outlined")
+        purpose = ui.input("借用用途").classes("full-width").props("outlined")
+        msg = ui.label("").classes("text-red")
+
+        with ui.row().classes("full-width justify-end gap-2"):
+            ui.button("取消", on_click=dialog.close).props("flat")
+
+            def do_borrow():
+                if not due_date.value:
+                    msg.text = "请填写归还日期"
+                    return
+                result = api.borrow_item(item_id, due_date.value, purpose.value or "")
+                if result.get("code") == 0:
+                    dialog.close()
+                    ui.notify("借用成功！", type="positive")
+                    ui.navigate.to(f"/items/{item_id}")
+                else:
+                    msg.text = result.get("msg", "借用失败")
+
+            ui.button("确认借用", on_click=do_borrow).props("color=blue")
+    dialog.open()
+
+
+def _show_scrap_dialog(item_id: int):
+    with ui.dialog() as dialog, ui.card().classes("w-96"):
+        ui.label("申请报废").classes("text-h6")
+        reason = ui.textarea("报废原因").classes("full-width").props("outlined")
+        msg = ui.label("").classes("text-red")
+
+        with ui.row().classes("full-width justify-end gap-2"):
+            ui.button("取消", on_click=dialog.close).props("flat")
+
+            def do_scrap():
+                if not reason.value:
+                    msg.text = "请填写报废原因"
+                    return
+                result = api.apply_scrap(item_id, reason.value)
+                if result.get("code") == 0:
+                    dialog.close()
+                    ui.notify("报废申请已提交", type="positive")
+                    ui.navigate.to(f"/items/{item_id}")
+                else:
+                    msg.text = result.get("msg", "申请失败")
+
+            ui.button("确认申请", on_click=do_scrap).props("color=red")
+    dialog.open()
+
+```
+
+---
+
+## `frontend/pages/items.py`
+
+```python
+"""物品列表页"""
+from nicegui import ui, app
+from api_client import api
+from components.navbar import navbar
+from components.status_badge import ITEM_STATUS
+
+
+@ui.page("/items")
+def items_page():
+    if not app.storage.user.get("user") or not app.storage.user.get("session_id"):
+        ui.navigate.to("/login")
+        return
+
+    navbar()
+    user = app.storage.user["user"]
+    is_admin = user.get("role") == "admin"
+
+    with ui.column().classes("q-pa-md w-full max-w-6xl mx-auto"):
+        # 标题 + 操作按钮
+        with ui.row().classes("w-full items-center justify-between"):
+            ui.label("物品管理").classes("text-h5")
+            if is_admin:
+                ui.button("录入物品", icon="add", on_click=lambda: ui.navigate.to("/items/create")).props("color=blue")
+
+        # 搜索栏
+        with ui.row().classes("w-full gap-2 q-mt-md"):
+            keyword_input = ui.input("搜索关键词", placeholder="名称或编号").classes("flex-1").props("outlined dense")
+            status_select = ui.select(
+                {"": "全部状态", "available": "可用", "borrowed": "已借出", "pending_scrap": "待报废", "scrapped": "已报废"},
+                value="",
+            ).classes("w-40").props("outlined dense")
+            search_btn = ui.button("搜索", icon="search").props("color=blue")
+
+        # 表格容器
+        table_container = ui.column().classes("w-full q-mt-md")
+
+        def load_items(page=1):
+            table_container.clear()
+            params = {"page": page, "page_size": 20}
+            if keyword_input.value:
+                params["keyword"] = keyword_input.value
+            if status_select.value:
+                params["status"] = status_select.value
+
+            try:
+                result = api.list_items(**params)
+                if result.get("code") != 0:
+                    with table_container:
+                        ui.label(f"加载失败: {result.get('msg')}").classes("text-red")
+                    return
+
+                data = result["data"]
+                items = data.get("items", [])
+                total = data.get("total", 0)
+
+                with table_container:
+                    if not items:
+                        ui.label("暂无物品").classes("text-grey text-center q-pa-lg")
+                        return
+
+                    # 表格
+                    columns = [
+                        {"name": "code", "label": "编号", "field": "code", "align": "left"},
+                        {"name": "name", "label": "名称", "field": "name", "align": "left"},
+                        {"name": "category", "label": "分类", "field": "category_name", "align": "left"},
+                        {"name": "status", "label": "状态", "field": "status", "align": "center"},
+                        {"name": "location", "label": "位置", "field": "location", "align": "left"},
+                        {"name": "action", "label": "操作", "field": "action", "align": "center"},
+                    ]
+                    rows = []
+                    for item in items:
+                        status_label = ITEM_STATUS.get(item["status"], (item["status"],))[0]
+                        rows.append({
+                            "id": item["id"],
+                            "code": item["code"],
+                            "name": item["name"],
+                            "category_name": item.get("category_name") or "-",
+                            "status": status_label,
+                            "location": item.get("location") or "-",
+                        })
+
+                    table = ui.table(columns=columns, rows=rows, row_key="id").classes("w-full")
+                    table.add_slot("body-cell-action", '''
+                        <q-td :props="props">
+                            <q-btn flat dense color="blue" icon="visibility" @click="$parent.$emit('view', props.row)" />
+                        </q-td>
+                    ''')
+                    table.on("view", lambda e: ui.navigate.to(f"/items/{e.args['id']}"))
+
+                    # 分页
+                    total_pages = (total + 19) // 20
+                    if total_pages > 1:
+                        with ui.row().classes("w-full justify-center q-mt-md"):
+                            for p in range(1, total_pages + 1):
+                                btn = ui.button(str(p), on_click=lambda _, pg=p: load_items(pg))
+                                if p == page:
+                                    btn.props("color=blue")
+                                else:
+                                    btn.props("flat")
+
+            except Exception as e:
+                with table_container:
+                    ui.label(f"请求失败: {e}").classes("text-red")
+
+        search_btn.on_click(lambda: load_items())
+        load_items()
+
+```
+
+---
+
+## `frontend/pages/login.py`
+
+```python
+"""登录页"""
+from nicegui import ui, app
+from api_client import api
+
+
+@ui.page("/login")
+@ui.page("/")
+def login_page():
+    # 已登录则跳转仪表盘
+    if app.storage.user.get("user"):
+        ui.navigate.to("/dashboard")
+        return
+
+    with ui.column().classes("absolute-center items-center"):
+        ui.label("📦 学校物品二维码管理系统").classes("text-h4 text-blue-8 q-mb-lg")
+
+        with ui.card().classes("w-80 q-pa-lg"):
+            ui.label("登录").classes("text-h5 text-center q-mb-md")
+
+            username = ui.input("用户名", placeholder="请输入用户名").classes("full-width").props("outlined")
+            password = ui.input("密码", placeholder="请输入密码", password=True, password_toggle_button=True).classes("full-width").props("outlined")
+            msg = ui.label("").classes("text-red text-center")
+
+            async def do_login():
+                if not username.value or not password.value:
+                    msg.text = "请输入用户名和密码"
+                    return
+                msg.text = ""
+                try:
+                    result = api.login(username.value, password.value)
+                    if result.get("code") == 0:
+                        app.storage.user["user"] = result["data"]
+                        # 登录后跳转回之前的页面（扫码场景）
+                        redirect = app.storage.user.pop("redirect", None)
+                        ui.navigate.to(redirect or "/dashboard")
+                    else:
+                        msg.text = result.get("msg", "登录失败")
+                except Exception as e:
+                    msg.text = f"连接后端失败: {e}"
+
+            ui.button("登 录", on_click=do_login, icon="login").classes("full-width q-mt-md").props("color=blue-8")
+            password.on("keydown.enter", do_login)
+
+        with ui.row().classes("q-mt-md text-grey"):
+            ui.label("测试账号: admin/admin123  teacher1/teacher1  student1/student1").classes("text-caption")
+
+```
+
+---
+
+## `frontend/pages/my_borrows.py`
+
+```python
+"""我的借用页"""
+from nicegui import ui, app
+from api_client import api
+from components.navbar import navbar
+from components.status_badge import BORROW_STATUS
+
+
+@ui.page("/my-borrows")
+def my_borrows_page():
+    if not app.storage.user.get("user") or not app.storage.user.get("session_id"):
+        ui.navigate.to("/login")
+        return
+
+    navbar()
+
+    with ui.column().classes("q-pa-md w-full max-w-6xl mx-auto"):
+        ui.label("我的借用").classes("text-h5")
+
+        # 筛选
+        with ui.row().classes("w-full gap-2 q-mt-md"):
+            status_select = ui.select(
+                {"": "全部", "active": "借用中", "returned": "已归还", "overdue": "逾期"},
+                value="",
+            ).classes("w-40").props("outlined dense")
+            search_btn = ui.button("筛选", icon="filter_list").props("color=blue")
+
+        table_container = ui.column().classes("w-full q-mt-md")
+
+        def load_my_borrows(page=1):
+            table_container.clear()
+            params = {"page": page, "page_size": 20}
+            if status_select.value:
+                params["status"] = status_select.value
+
+            try:
+                result = api.my_borrows(**params)
+                if result.get("code") != 0:
+                    with table_container:
+                        ui.label(f"加载失败: {result.get('msg')}").classes("text-red")
+                    return
+
+                data = result["data"]
+                records = data.get("items", [])
+                total = data.get("total", 0)
+
+                with table_container:
+                    if not records:
+                        ui.label("暂无借用记录").classes("text-grey text-center q-pa-lg")
+                        return
+
+                    columns = [
+                        {"name": "item_code", "label": "物品编号", "field": "item_code", "align": "left"},
+                        {"name": "item_name", "label": "物品名称", "field": "item_name", "align": "left"},
+                        {"name": "borrow_date", "label": "借出日期", "field": "borrow_date", "align": "left"},
+                        {"name": "due_date", "label": "应还日期", "field": "due_date", "align": "left"},
+                        {"name": "return_date", "label": "归还日期", "field": "return_date", "align": "left"},
+                        {"name": "status", "label": "状态", "field": "status_label", "align": "center"},
+                        {"name": "action", "label": "操作", "field": "action", "align": "center"},
+                    ]
+                    rows = []
+                    for r in records:
+                        status_label = BORROW_STATUS.get(r["status"], (r["status"],))[0]
+                        rows.append({
+                            "id": r["id"],
+                            "item_id": r["item_id"],
+                            "item_code": r.get("item_code", ""),
+                            "item_name": r.get("item_name", ""),
+                            "borrow_date": r.get("borrow_date", "")[:10],
+                            "due_date": str(r.get("due_date", "")),
+                            "return_date": (r.get("return_date") or "")[:10] or "未归还",
+                            "status": r["status"],
+                            "status_label": status_label,
+                        })
+
+                    table = ui.table(columns=columns, rows=rows, row_key="id").classes("w-full")
+                    table.add_slot("body-cell-action", '''
+                        <q-td :props="props">
+                            <q-btn v-if="props.row.status === 'active' || props.row.status === 'overdue'"
+                                   flat dense color="green" label="归还"
+                                   @click="$parent.$emit('return_item', props.row)" />
+                            <q-btn flat dense color="blue" icon="visibility"
+                                   @click="$parent.$emit('view_item', props.row)" />
+                        </q-td>
+                    ''')
+                    table.on("return_item", lambda e: _show_return_dialog(e.args["id"], load_my_borrows))
+                    table.on("view_item", lambda e: ui.navigate.to(f"/items/{e.args['item_id']}"))
+
+                    # 分页
+                    total_pages = (total + 19) // 20
+                    if total_pages > 1:
+                        with ui.row().classes("w-full justify-center q-mt-md"):
+                            for p in range(1, total_pages + 1):
+                                btn = ui.button(str(p), on_click=lambda _, pg=p: load_my_borrows(pg))
+                                if p == page:
+                                    btn.props("color=blue")
+                                else:
+                                    btn.props("flat")
+
+            except Exception as e:
+                with table_container:
+                    ui.label(f"请求失败: {e}").classes("text-red")
+
+        search_btn.on_click(lambda: load_my_borrows())
+        load_my_borrows()
+
+
+def _show_return_dialog(borrow_id: int, reload_fn):
+    with ui.dialog() as dialog, ui.card().classes("w-96"):
+        ui.label("归还物品").classes("text-h6")
+        return_note = ui.input("物品状况备注", placeholder="如：完好无损").classes("full-width").props("outlined")
+        msg = ui.label("").classes("text-red")
+
+        with ui.row().classes("full-width justify-end gap-2"):
+            ui.button("取消", on_click=dialog.close).props("flat")
+
+            def do_return():
+                result = api.return_item(borrow_id, return_note.value or "")
+                if result.get("code") == 0:
+                    dialog.close()
+                    ui.notify("归还成功！", type="positive")
+                    reload_fn()
+                else:
+                    msg.text = result.get("msg", "归还失败")
+
+            ui.button("确认归还", on_click=do_return).props("color=green")
+    dialog.open()
+
+```
+
+---
+
+## `frontend/pages/scraps.py`
+
+```python
+"""报废管理页"""
+from nicegui import ui, app
+from api_client import api
+from components.navbar import navbar
+from components.status_badge import SCRAP_STATUS
+
+
+@ui.page("/scraps")
+def scraps_page():
+    if not app.storage.user.get("user") or not app.storage.user.get("session_id"):
+        ui.navigate.to("/login")
+        return
+
+    navbar()
+    user = app.storage.user["user"]
+    is_admin = user.get("role") == "admin"
+
+    with ui.column().classes("q-pa-md w-full max-w-6xl mx-auto"):
+        ui.label("报废管理").classes("text-h5")
+
+        # 筛选
+        with ui.row().classes("w-full gap-2 q-mt-md"):
+            status_select = ui.select(
+                {"": "全部", "pending": "待审批", "approved": "已通过", "rejected": "已驳回"},
+                value="",
+            ).classes("w-40").props("outlined dense")
+            search_btn = ui.button("筛选", icon="filter_list").props("color=blue")
+
+        table_container = ui.column().classes("w-full q-mt-md")
+
+        def load_scraps(page=1):
+            table_container.clear()
+            params = {"page": page, "page_size": 20}
+            if status_select.value:
+                params["status"] = status_select.value
+
+            try:
+                result = api.list_scraps(**params)
+                if result.get("code") != 0:
+                    with table_container:
+                        ui.label(f"加载失败: {result.get('msg')}").classes("text-red")
+                    return
+
+                data = result["data"]
+                records = data.get("items", [])
+                total = data.get("total", 0)
+
+                with table_container:
+                    if not records:
+                        ui.label("暂无报废记录").classes("text-grey text-center q-pa-lg")
+                        return
+
+                    columns = [
+                        {"name": "item_code", "label": "物品编号", "field": "item_code", "align": "left"},
+                        {"name": "item_name", "label": "物品名称", "field": "item_name", "align": "left"},
+                        {"name": "applicant", "label": "申请人", "field": "applicant_name", "align": "left"},
+                        {"name": "reason", "label": "报废原因", "field": "reason", "align": "left"},
+                        {"name": "apply_time", "label": "申请时间", "field": "apply_time", "align": "left"},
+                        {"name": "status", "label": "状态", "field": "status_label", "align": "center"},
+                    ]
+
+                    if is_admin:
+                        columns.append({"name": "action", "label": "操作", "field": "action", "align": "center"})
+
+                    rows = []
+                    for r in records:
+                        status_label = SCRAP_STATUS.get(r["status"], (r["status"],))[0]
+                        rows.append({
+                            "id": r["id"],
+                            "item_code": r.get("item_code", ""),
+                            "item_name": r.get("item_name", ""),
+                            "applicant_name": r.get("applicant_name", ""),
+                            "reason": r.get("reason", "")[:30],
+                            "apply_time": r.get("apply_time", "")[:16],
+                            "status": r["status"],
+                            "status_label": status_label,
+                        })
+
+                    table = ui.table(columns=columns, rows=rows, row_key="id").classes("w-full")
+
+                    if is_admin:
+                        table.add_slot("body-cell-action", '''
+                            <q-td :props="props">
+                                <q-btn v-if="props.row.status === 'pending'"
+                                       flat dense color="green" label="通过"
+                                       @click="$parent.$emit('approve', props.row)" class="q-mr-xs" />
+                                <q-btn v-if="props.row.status === 'pending'"
+                                       flat dense color="red" label="驳回"
+                                       @click="$parent.$emit('reject', props.row)" />
+                            </q-td>
+                        ''')
+                        table.on("approve", lambda e: _show_approve_dialog(e.args["id"], True, load_scraps))
+                        table.on("reject", lambda e: _show_approve_dialog(e.args["id"], False, load_scraps))
+
+                    # 分页
+                    total_pages = (total + 19) // 20
+                    if total_pages > 1:
+                        with ui.row().classes("w-full justify-center q-mt-md"):
+                            for p in range(1, total_pages + 1):
+                                btn = ui.button(str(p), on_click=lambda _, pg=p: load_scraps(pg))
+                                if p == page:
+                                    btn.props("color=blue")
+                                else:
+                                    btn.props("flat")
+
+            except Exception as e:
+                with table_container:
+                    ui.label(f"请求失败: {e}").classes("text-red")
+
+        search_btn.on_click(lambda: load_scraps())
+        load_scraps()
+
+
+def _show_approve_dialog(scrap_id: int, is_approve: bool, reload_fn):
+    title = "审批通过" if is_approve else "审批驳回"
+    color = "green" if is_approve else "red"
+
+    with ui.dialog() as dialog, ui.card().classes("w-96"):
+        ui.label(title).classes("text-h6")
+        note = ui.input("审批备注", placeholder="如：确认报废 / 建议先维修").classes("full-width").props("outlined")
+        msg = ui.label("").classes("text-red")
+
+        with ui.row().classes("full-width justify-end gap-2"):
+            ui.button("取消", on_click=dialog.close).props("flat")
+
+            def do_action():
+                if is_approve:
+                    result = api.approve_scrap(scrap_id, note.value or "")
+                else:
+                    result = api.reject_scrap(scrap_id, note.value or "")
+
+                if result.get("code") == 0:
+                    dialog.close()
+                    ui.notify(f"{title}成功", type="positive")
+                    reload_fn()
+                else:
+                    msg.text = result.get("msg", "操作失败")
+
+            ui.button("确认", on_click=do_action).props(f"color={color}")
+    dialog.open()
+
+```
+
+---
+
+## `frontend/pages/users.py`
+
+```python
+"""用户管理页（Admin only）"""
+from nicegui import ui, app
+from api_client import api
+from components.navbar import navbar
+
+
+ROLE_LABELS = {"admin": "管理员", "staff": "教职工", "student": "学生"}
+
+
+@ui.page("/users")
+def users_page():
+    if not app.storage.user.get("user") or not app.storage.user.get("session_id"):
+        ui.navigate.to("/login")
+        return
+
+    user = app.storage.user["user"]
+    if user.get("role") != "admin":
+        ui.navigate.to("/dashboard")
+        return
+
+    navbar()
+
+    with ui.column().classes("q-pa-md w-full max-w-6xl mx-auto"):
+        with ui.row().classes("w-full items-center justify-between"):
+            ui.label("用户管理").classes("text-h5")
+            ui.button("添加用户", icon="person_add", on_click=lambda: _show_create_dialog(load_users)).props("color=blue")
+
+        table_container = ui.column().classes("w-full q-mt-md")
+
+        def load_users(page=1):
+            table_container.clear()
+
+            try:
+                result = api.list_users(page=page, page_size=20)
+                if result.get("code") != 0:
+                    with table_container:
+                        ui.label(f"加载失败: {result.get('msg')}").classes("text-red")
+                    return
+
+                data = result["data"]
+                users = data.get("items", [])
+                total = data.get("total", 0)
+
+                with table_container:
+                    if not users:
+                        ui.label("暂无用户").classes("text-grey text-center q-pa-lg")
+                        return
+
+                    columns = [
+                        {"name": "username", "label": "用户名", "field": "username", "align": "left"},
+                        {"name": "real_name", "label": "姓名", "field": "real_name", "align": "left"},
+                        {"name": "role", "label": "角色", "field": "role_label", "align": "center"},
+                        {"name": "phone", "label": "电话", "field": "phone", "align": "left"},
+                        {"name": "is_active", "label": "状态", "field": "active_label", "align": "center"},
+                        {"name": "action", "label": "操作", "field": "action", "align": "center"},
+                    ]
+                    rows = []
+                    for u in users:
+                        rows.append({
+                            "id": u["id"],
+                            "username": u["username"],
+                            "real_name": u["real_name"],
+                            "role": u["role"],
+                            "role_label": ROLE_LABELS.get(u["role"], u["role"]),
+                            "phone": u.get("phone") or "-",
+                            "is_active": u.get("is_active", True),
+                            "active_label": "启用" if u.get("is_active", True) else "已禁用",
+                        })
+
+                    table = ui.table(columns=columns, rows=rows, row_key="id").classes("w-full")
+                    table.add_slot("body-cell-action", '''
+                        <q-td :props="props">
+                            <q-btn flat dense color="blue" label="编辑"
+                                   @click="$parent.$emit('edit', props.row)" class="q-mr-xs" />
+                            <q-btn v-if="props.row.is_active"
+                                   flat dense color="red" label="禁用"
+                                   @click="$parent.$emit('disable', props.row)" />
+                        </q-td>
+                    ''')
+                    table.on("edit", lambda e: _show_edit_dialog(e.args, load_users))
+                    table.on("disable", lambda e: _do_disable(e.args["id"], load_users))
+
+                    # 分页
+                    total_pages = (total + 19) // 20
+                    if total_pages > 1:
+                        with ui.row().classes("w-full justify-center q-mt-md"):
+                            for p in range(1, total_pages + 1):
+                                btn = ui.button(str(p), on_click=lambda _, pg=p: load_users(pg))
+                                if p == page:
+                                    btn.props("color=blue")
+                                else:
+                                    btn.props("flat")
+
+            except Exception as e:
+                with table_container:
+                    ui.label(f"请求失败: {e}").classes("text-red")
+
+        load_users()
+
+
+def _show_create_dialog(reload_fn):
+    with ui.dialog() as dialog, ui.card().classes("w-96"):
+        ui.label("添加用户").classes("text-h6")
+        username = ui.input("用户名 *").classes("full-width").props("outlined")
+        password = ui.input("密码 *", password=True).classes("full-width").props("outlined")
+        real_name = ui.input("真实姓名 *").classes("full-width").props("outlined")
+        role = ui.select({"student": "学生", "staff": "教职工", "admin": "管理员"}, value="student", label="角色").classes("full-width").props("outlined")
+        phone = ui.input("电话").classes("full-width").props("outlined")
+        msg = ui.label("").classes("text-red")
+
+        with ui.row().classes("full-width justify-end gap-2"):
+            ui.button("取消", on_click=dialog.close).props("flat")
+
+            def do_create():
+                if not username.value or not password.value or not real_name.value:
+                    msg.text = "请填写必填项"
+                    return
+                data = {
+                    "username": username.value,
+                    "password": password.value,
+                    "real_name": real_name.value,
+                    "role": role.value,
+                }
+                if phone.value:
+                    data["phone"] = phone.value
+
+                result = api.create_user(data)
+                if result.get("code") == 0:
+                    dialog.close()
+                    ui.notify("用户创建成功", type="positive")
+                    reload_fn()
+                else:
+                    msg.text = result.get("msg", "创建失败")
+
+            ui.button("创建", on_click=do_create).props("color=blue")
+    dialog.open()
+
+
+def _show_edit_dialog(user_data: dict, reload_fn):
+    user_id = user_data["id"]
+    with ui.dialog() as dialog, ui.card().classes("w-96"):
+        ui.label("编辑用户").classes("text-h6")
+        ui.label(f"用户名: {user_data['username']}").classes("text-grey")
+        real_name = ui.input("真实姓名", value=user_data["real_name"]).classes("full-width").props("outlined")
+        role = ui.select(
+            {"student": "学生", "staff": "教职工", "admin": "管理员"},
+            value=user_data["role"],
+            label="角色",
+        ).classes("full-width").props("outlined")
+        phone = ui.input("电话", value=user_data.get("phone") or "").classes("full-width").props("outlined")
+        msg = ui.label("").classes("text-red")
+
+        with ui.row().classes("full-width justify-end gap-2"):
+            ui.button("取消", on_click=dialog.close).props("flat")
+
+            def do_update():
+                data = {}
+                if real_name.value:
+                    data["real_name"] = real_name.value
+                if role.value:
+                    data["role"] = role.value
+                if phone.value:
+                    data["phone"] = phone.value
+
+                result = api.update_user(user_id, data)
+                if result.get("code") == 0:
+                    dialog.close()
+                    ui.notify("用户更新成功", type="positive")
+                    reload_fn()
+                else:
+                    msg.text = result.get("msg", "更新失败")
+
+            ui.button("保存", on_click=do_update).props("color=blue")
+    dialog.open()
+
+
+def _do_disable(user_id: int, reload_fn):
+    result = api.disable_user(user_id)
+    if result.get("code") == 0:
+        ui.notify("用户已禁用", type="warning")
+        reload_fn()
+    else:
+        ui.notify(result.get("msg", "操作失败"), type="negative")
+
+```
+
+---
+
+
+============================================================
+ALL_BACKEND_CODE.md
+============================================================
+# School QR Code System — Backend Complete Code
+
+Total files: 36
+
+---
+
+## `requirements.txt`
+
+```text
+# 后端
+fastapi>=0.110
+uvicorn>=0.29
+sqlalchemy>=2.0
+pydantic>=2.0
+qrcode[pil]>=7.4
+reportlab>=4.0
+apscheduler>=3.10
+python-multipart>=0.0.9
+
+# 前端
+nicegui>=2.0
+httpx>=0.27
+
+```
+
+---
+
+## `README.md`
+
+```markdown
+# 学校物品二维码管理系统
+
+物品录入 → 借出 → 归还 → 报废 全生命周期管理
+
+---
+
+## 本地启动后端
+
+### 1. 安装依赖
+
+```bash
+cd school-qrcode-system
+pip install -r requirements.txt
+```
+
+### 2. 初始化数据库（首次运行）
+
+```bash
+cd backend
+python init_db.py
+```
+
+默认创建以下测试账号：
+
+| 用户名    | 密码      | 角色    |
+|-----------|-----------|---------|
+| admin     | admin123  | 管理员  |
+| teacher1  | teacher1  | 教职工  |
+| student1  | student1  | 学生    |
+
+### 3. 启动后端
+
+```bash
+cd backend
+python main.py
+```
+
+默认端口 **8000**，API 文档：http://localhost:8000/docs
+
+### 4. 使用自定义端口
+
+通过环境变量设置：
+
+```bash
+# macOS / Linux
+API_PORT=9090 python main.py
+
+# 或者 export
+export API_PORT=9090
+python main.py
+```
+
+### 5. 所有可配置环境变量
+
+| 变量名         | 默认值                          | 说明                        |
+|----------------|--------------------------------|-----------------------------|
+| API_PORT       | 8000                           | 后端 API 端口               |
+| DB_PATH        | data/school_qr.db              | SQLite 数据库文件路径        |
+| SESSION_SECRET | dev-secret-change-in-prod      | Session 签名密钥             |
+| SERVER_HOST    | localhost:8080                  | 二维码中的前端地址           |
+| STATIC_DIR     | static                         | 静态文件目录（二维码/PDF）   |
+
+### 6. 验证后端运行
+
+```bash
+# 健康检查
+curl http://localhost:8000/
+
+# 登录（获取 session cookie）
+curl -c cookies.txt -X POST http://localhost:8000/api/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"admin","password":"admin123"}'
+
+# 查看物品列表（带 cookie）
+curl -b cookies.txt http://localhost:8000/api/items
+
+# 查看仪表盘统计
+curl -b cookies.txt http://localhost:8000/api/dashboard/stats
+```
+
+---
+
+## 启动前端
+
+```bash
+cd frontend
+python main.py
+```
+
+默认端口 **8080**，打开浏览器访问：http://localhost:8080
+
+自定义端口：
+
+```bash
+FRONTEND_PORT=9091 python main.py
+```
+
+> 注意：前端需要后端先启动。默认连接 http://localhost:8000/api
+> 如需修改后端地址：`API_BASE_URL=http://localhost:9090/api python main.py`
+
+---
+
+## 项目结构
+
+```
+school-qrcode-system/
+├── docs/                  # 设计文档
+├── backend/               # FastAPI 后端
+│   ├── main.py            # 入口
+│   ├── config.py          # 配置
+│   ├── database.py        # SQLAlchemy 引擎
+│   ├── init_db.py         # 建表 + 种子数据
+│   ├── models/            # ORM 模型
+│   ├── schemas/           # Pydantic 请求/响应
+│   ├── services/          # 业务逻辑
+│   ├── routers/           # API 路由
+│   └── utils/             # 认证 & 依赖注入
+├── frontend/              # NiceGUI 前端（待实现）
+└── requirements.txt
+```
+
+```
+
+---
+
+## `backend/config.py`
+
+```python
+"""应用配置"""
+import os
+
+# 数据库路径
+DB_PATH = os.getenv("DB_PATH", "data/school_qr.db")
+DATABASE_URL = f"sqlite:///{DB_PATH}"
+
+# Session 密钥
+SESSION_SECRET = os.getenv("SESSION_SECRET", "dev-secret-change-in-prod")
+
+# 服务端口
+API_PORT = int(os.getenv("API_PORT", "8000"))
+
+# 二维码中的服务器地址（扫码后跳转用）
+SERVER_HOST = os.getenv("SERVER_HOST", "localhost:8080")
+
+# 静态文件目录
+STATIC_DIR = os.getenv("STATIC_DIR", "static")
+QRCODE_DIR = os.path.join(STATIC_DIR, "qrcodes")
+EXPORT_DIR = os.path.join(STATIC_DIR, "exports")
+
+```
+
+---
+
+## `backend/database.py`
+
+```python
+"""SQLAlchemy 引擎 & Session 管理"""
+import os
+from sqlalchemy import create_engine, event
+from sqlalchemy.orm import sessionmaker, DeclarativeBase
+
+from config import DATABASE_URL, DB_PATH
+
+
+class Base(DeclarativeBase):
+    """ORM 基类"""
+    pass
+
+
+# 确保数据库目录存在
+os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
+
+# 创建引擎（SQLite 开启 WAL 模式提升并发性能）
+engine = create_engine(
+    DATABASE_URL,
+    connect_args={"check_same_thread": False},
+    echo=False,
+)
+
+
+# SQLite 开启外键约束
+@event.listens_for(engine, "connect")
+def _set_sqlite_pragma(dbapi_conn, connection_record):
+    cursor = dbapi_conn.cursor()
+    cursor.execute("PRAGMA journal_mode=WAL")
+    cursor.execute("PRAGMA foreign_keys=ON")
+    cursor.close()
+
+
+# Session 工厂
+SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+
+
+def get_db():
+    """FastAPI 依赖注入：获取数据库 Session"""
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+def init_db():
+    """建表（如果不存在）"""
+    import models  # noqa: F401 — 触发所有 model 注册
+    Base.metadata.create_all(bind=engine)
+
+```
+
+---
+
+## `backend/init_db.py`
+
+```python
+"""初始化数据库：建表 + 插入默认数据"""
+import hashlib
+from database import init_db, SessionLocal
+from models import User, Category
+
+
+def hash_password(password: str) -> str:
+    """简单密码哈希（SHA256），生产环境建议用 bcrypt"""
+    return hashlib.sha256(password.encode()).hexdigest()
+
+
+def seed_data():
+    """插入默认管理员和常用分类"""
+    db = SessionLocal()
+    try:
+        # 默认管理员（如果不存在）
+        if not db.query(User).filter_by(username="admin").first():
+            admin = User(
+                username="admin",
+                password_hash=hash_password("admin123"),
+                real_name="系统管理员",
+                role="admin",
+            )
+            db.add(admin)
+            print("  ✓ 创建默认管理员: admin / admin123")
+
+        # 测试用户
+        test_users = [
+            ("teacher1", "teacher1", "张老师", "staff"),
+            ("student1", "student1", "李同学", "student"),
+        ]
+        for uname, pwd, rname, role in test_users:
+            if not db.query(User).filter_by(username=uname).first():
+                db.add(User(
+                    username=uname,
+                    password_hash=hash_password(pwd),
+                    real_name=rname,
+                    role=role,
+                ))
+                print(f"  ✓ 创建测试用户: {uname} / {pwd} ({role})")
+
+        # 默认分类
+        default_categories = [
+            ("电子设备", "电脑、投影仪、平板等"),
+            ("体育器材", "篮球、足球、羽毛球拍等"),
+            ("实验器材", "显微镜、烧杯、万用表等"),
+            ("办公用品", "打印机、订书机、白板等"),
+            ("图书", "教材、参考书、期刊等"),
+            ("教学器材", "教具、模型、挂图等"),
+        ]
+        for name, desc in default_categories:
+            if not db.query(Category).filter_by(name=name).first():
+                db.add(Category(name=name, description=desc))
+                print(f"  ✓ 创建分类: {name}")
+
+        db.commit()
+    finally:
+        db.close()
+
+
+if __name__ == "__main__":
+    print("=== 初始化数据库 ===")
+    print("1. 建表...")
+    init_db()
+    print("  ✓ 所有表创建完成")
+    print("2. 插入默认数据...")
+    seed_data()
+    print("=== 初始化完成 ===")
+
+```
+
+---
+
+## `backend/main.py`
+
+```python
+"""FastAPI 后端入口"""
+import os
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from apscheduler.schedulers.background import BackgroundScheduler
+
+from config import API_PORT, STATIC_DIR, QRCODE_DIR, EXPORT_DIR
+from database import init_db, SessionLocal
+from services.borrow_service import mark_overdue
+
+# 确保静态目录存在
+for d in [STATIC_DIR, QRCODE_DIR, EXPORT_DIR]:
+    os.makedirs(d, exist_ok=True)
+
+
+# --- 定时任务：逾期标记 ---
+scheduler = BackgroundScheduler()
+
+
+def _run_overdue_check():
+    """每天检查逾期借用"""
+    db = SessionLocal()
+    try:
+        count = mark_overdue(db)
+        if count:
+            print(f"[定时任务] 标记 {count} 条逾期借用记录")
+    finally:
+        db.close()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # 启动时
+    init_db()
+    print("✓ 数据库初始化完成")
+    scheduler.add_job(_run_overdue_check, "cron", hour=1, minute=0)
+    scheduler.start()
+    print("✓ 逾期检测定时任务已启动 (每天 01:00)")
+    yield
+    # 关闭时
+    scheduler.shutdown()
+
+
+# --- FastAPI 应用 ---
+app = FastAPI(
+    title="学校物品二维码管理系统",
+    description="物品录入→借出→归还→报废 全生命周期管理",
+    version="1.0.0",
+    lifespan=lifespan,
+)
+
+# CORS（前端 NiceGUI 可能跑在不同端口）
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# 静态文件（二维码图片等）
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+# --- 注册路由 ---
+from routers.auth import router as auth_router
+from routers.items import router as items_router
+from routers.borrows import router as borrows_router
+from routers.scraps import router as scraps_router
+from routers.users import router as users_router
+from routers.dashboard import router as dashboard_router
+
+app.include_router(auth_router)
+app.include_router(items_router)
+app.include_router(borrows_router)
+app.include_router(scraps_router)
+app.include_router(users_router)
+app.include_router(dashboard_router)
+
+
+@app.get("/")
+def root():
+    return {"msg": "学校物品二维码管理系统 API", "docs": "/docs"}
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=API_PORT, reload=True)
+
+```
+
+---
+
+## `backend/seed_test_data.py`
+
+```python
+"""清理物品表并插入完整的多分类测试数据"""
+import hashlib
+from datetime import date, datetime
+from database import init_db, SessionLocal
+from models import User, Category, Item, BorrowRecord, ScrapRecord
+from services.qrcode_service import generate_qrcode
+
+
+def hash_password(password: str) -> str:
+    return hashlib.sha256(password.encode()).hexdigest()
+
+
+def run():
+    db = SessionLocal()
+    try:
+        # ========== 1. 清理旧数据 ==========
+        db.query(ScrapRecord).delete()
+        db.query(BorrowRecord).delete()
+        db.query(Item).delete()
+        db.query(Category).delete()
+        db.query(User).delete()
+        db.commit()
+        print("✓ 已清理所有旧数据")
+
+        # ========== 2. 重建用户 ==========
+        users = [
+            ("admin", "admin123", "系统管理员", "admin", "13800000000"),
+            ("teacher1", "teacher1", "张老师", "staff", "13811111111"),
+            ("teacher2", "teacher2", "王老师", "staff", "13822222222"),
+            ("student1", "student1", "李同学", "student", "13900000001"),
+            ("student2", "student2", "赵同学", "student", "13900000002"),
+            ("student3", "student3", "陈同学", "student", "13900000003"),
+        ]
+        user_map = {}
+        for uname, pwd, rname, role, phone in users:
+            u = User(username=uname, password_hash=hash_password(pwd),
+                     real_name=rname, role=role, phone=phone)
+            db.add(u)
+            db.flush()
+            user_map[uname] = u.id
+            print(f"  ✓ 用户: {uname} / {pwd} ({role})")
+
+        # ========== 3. 重建分类 ==========
+        categories_data = [
+            ("电子设备", "电脑、投影仪、平板等"),
+            ("体育器材", "篮球、足球、羽毛球拍等"),
+            ("实验器材", "显微镜、烧杯、万用表等"),
+            ("办公用品", "打印机、订书机、白板等"),
+            ("图书", "教材、参考书、期刊等"),
+            ("教学器材", "教具、模型、挂图等"),
+            ("乐器", "钢琴、吉他、小提琴等"),
+            ("家具", "课桌、椅子、书柜等"),
+        ]
+        cat_map = {}
+        for name, desc in categories_data:
+            c = Category(name=name, description=desc)
+            db.add(c)
+            db.flush()
+            cat_map[name] = c.id
+            print(f"  ✓ 分类: {name}")
+
+        # ========== 4. 插入测试物品 ==========
+        seq = 0
+
+        def make_code():
+            nonlocal seq
+            seq += 1
+            return f"ITM-20260424-{seq:04d}"
+
+        items_data = [
+            # --- 电子设备 ---
+            ("EPSON CB-X06 投影仪", "电子设备", "EPSON CB-X06", "2023-09-01", 3599.00, "教学楼A栋 301室", "3600流明，XGA分辨率，含遥控器"),
+            ("联想ThinkPad E14 笔记本", "电子设备", "ThinkPad E14 Gen5", "2024-03-15", 4299.00, "计算机实验室 201室", "i5-13500H/16G/512G，教师办公用"),
+            ("iPad Air (第5代)", "电子设备", "iPad Air M1 64GB", "2024-06-01", 4399.00, "信息中心 105室", "教学演示用，含Apple Pencil"),
+            ("Dell P2422H 显示器", "电子设备", "P2422H 24寸", "2023-06-15", 1299.00, "办公楼 302室", "IPS面板，旋转升降支架"),
+            ("佳能PIXMA G3810打印机", "电子设备", "Canon G3810", "2024-01-10", 999.00, "教务处 101室", "彩色喷墨，无线打印"),
+
+            # --- 体育器材 ---
+            ("摩腾GG7X 篮球", "体育器材", "Molten GG7X", "2024-04-15", 189.00, "体育器材室", "比赛用球，共10个"),
+            ("红双喜DHS 乒乓球拍", "体育器材", "DHS 6星横拍", "2024-02-20", 299.00, "体育器材室", "套装含3个球"),
+            ("尤尼克斯羽毛球拍", "体育器材", "YONEX ARC-7", "2023-11-08", 459.00, "体育器材室", "全碳素，含拍包"),
+            ("跳绳（计数款）", "体育器材", "Li-Ning AQAH182", "2024-03-01", 39.00, "体育器材室", "电子计数，钢丝绳，共20根"),
+            ("足球（5号）", "体育器材", "STAR SB515", "2024-05-10", 129.00, "体育器材室", "PU材质比赛球，共8个"),
+
+            # --- 实验器材 ---
+            ("生物显微镜", "实验器材", "Olympus CX23", "2022-09-01", 6800.00, "生物实验室 401室", "双目，40X-1000X"),
+            ("数字万用表", "实验器材", "Fluke 15B+", "2023-03-20", 580.00, "物理实验室 302室", "自动量程，共15台"),
+            ("电子天平", "实验器材", "梅特勒 ME204", "2023-06-15", 4200.00, "化学实验室 501室", "0.1mg精度，220g量程"),
+            ("示波器", "实验器材", "Rigol DS1054Z", "2022-12-10", 2800.00, "电子实验室 203室", "50MHz 4通道"),
+
+            # --- 办公用品 ---
+            ("得力碎纸机", "办公用品", "Deli 9939", "2024-01-20", 699.00, "行政办公室 201室", "4级保密，15张/次"),
+            ("白板（磁性）", "办公用品", "120x90cm 双面", "2023-09-01", 189.00, "会议室 A301", "含白板笔和磁扣套装"),
+            ("考勤机", "办公用品", "中控 ZKTeco K40", "2024-02-01", 399.00, "校门口门卫室", "指纹+刷卡，容量3000人"),
+
+            # --- 图书 ---
+            ("高等数学（第七版）上册", "图书", "ISBN 978-7-04-039663-8", "2024-03-15", 34.90, "图书馆 A区 3层 12架", "同济大学版，共50本"),
+            ("Python编程：从入门到实践（第3版）", "图书", "ISBN 978-7-115-57614-2", "2024-06-01", 89.80, "图书馆 B区 2层 05架", "人民邮电出版社"),
+            ("新概念英语（第二册）", "图书", "ISBN 978-7-5600-1346-1", "2023-09-10", 29.90, "图书馆 A区 1层 08架", "外研社，教学用书，共30本"),
+            ("大学物理实验", "图书", "ISBN 978-7-04-052834-4", "2024-02-28", 39.80, "图书馆 A区 3层 15架", "高等教育出版社"),
+            ("数据结构（C语言版）", "图书", "ISBN 978-7-302-33064-6", "2023-08-15", 49.00, "图书馆 B区 2层 03架", "严蔚敏著，清华大学出版社"),
+
+            # --- 教学器材 ---
+            ("人体骨骼模型", "教学器材", "170cm全身骨架", "2022-06-01", 1280.00, "生物教研室 501室", "医用级PVC材质"),
+            ("地球仪（大号）", "教学器材", "32cm带灯光", "2023-09-01", 158.00, "地理教研室 302室", "中英文标注，LED底灯"),
+            ("三角板教学套装", "教学器材", "60cm磁性", "2024-01-15", 89.00, "教学楼B栋 数学组", "含直尺、三角板、量角器"),
+
+            # --- 乐器 ---
+            ("雅马哈电钢琴", "乐器", "Yamaha P-145", "2024-01-10", 3299.00, "音乐教室 601室", "88键重锤，含X架和踏板"),
+            ("古典吉他", "乐器", "Yamaha C40", "2023-09-15", 699.00, "音乐教室 601室", "39寸入门款，共5把"),
+            ("竖笛（高音）", "乐器", "AULOS 204A", "2024-03-01", 68.00, "音乐教室 601室", "日本产，ABS树脂，共30支"),
+
+            # --- 家具 ---
+            ("学生课桌椅套装", "家具", "标准型 60x40cm", "2023-07-01", 280.00, "教学楼C栋 仓库", "钢木结构，可调高度，共200套"),
+            ("教师办公桌", "家具", "1.4m L型转角", "2024-01-20", 1580.00, "办公楼 305室", "含抽屉柜和键盘托"),
+        ]
+
+        for name, cat_name, model, pdate, price, loc, remark in items_data:
+            item = Item(
+                code=make_code(),
+                name=name,
+                category_id=cat_map[cat_name],
+                model=model,
+                status="available",
+                purchase_date=date.fromisoformat(pdate),
+                purchase_price=price,
+                location=loc,
+                remark=remark,
+            )
+            db.add(item)
+            db.flush()
+            # 生成二维码
+            qr_path = generate_qrcode(item.id, item.code)
+            item.qrcode_path = qr_path
+            print(f"  ✓ 物品: [{cat_name}] {name} → {item.code}")
+
+        db.commit()
+        print(f"\n=== 完成！共插入 {len(users)} 个用户、{len(categories_data)} 个分类、{len(items_data)} 个物品 ===")
+
+    finally:
+        db.close()
+
+
+if __name__ == "__main__":
+    print("=== 清理并重建测试数据 ===\n")
+    init_db()
+    run()
+
+```
+
+---
+
+## `backend/models/__init__.py`
+
+```python
+"""ORM 模型 — 导入所有表，确保 Base.metadata 注册完整"""
+from models.user import User
+from models.category import Category
+from models.item import Item
+from models.borrow import BorrowRecord
+from models.scrap import ScrapRecord
+
+__all__ = ["User", "Category", "Item", "BorrowRecord", "ScrapRecord"]
+
+```
+
+---
+
+## `backend/models/borrow.py`
+
+```python
+"""借用记录表"""
+from datetime import datetime, date
+from sqlalchemy import String, Date, DateTime, ForeignKey
+from sqlalchemy.orm import Mapped, mapped_column
+
+from database import Base
+
+
+class BorrowRecord(Base):
+    __tablename__ = "borrow_record"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    item_id: Mapped[int] = mapped_column(ForeignKey("item.id"), nullable=False, index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("user.id"), nullable=False, index=True)
+    borrow_date: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.now)
+    due_date: Mapped[date] = mapped_column(Date, nullable=False)
+    return_date: Mapped[datetime | None] = mapped_column(DateTime)
+    status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="active", index=True
+    )  # active / returned / overdue
+    purpose: Mapped[str | None] = mapped_column(String(200))
+    return_note: Mapped[str | None] = mapped_column(String(200))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+
+```
+
+---
+
+## `backend/models/category.py`
+
+```python
+"""分类表"""
+from sqlalchemy import String
+from sqlalchemy.orm import Mapped, mapped_column
+
+from database import Base
+
+
+class Category(Base):
+    __tablename__ = "category"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(50), unique=True, nullable=False)
+    description: Mapped[str | None] = mapped_column(String(200))
+
+```
+
+---
+
+## `backend/models/item.py`
+
+```python
+"""物品表"""
+from datetime import datetime, date
+from decimal import Decimal
+from sqlalchemy import String, Date, DateTime, Numeric, Text, ForeignKey
+from sqlalchemy.orm import Mapped, mapped_column
+
+from database import Base
+
+
+class Item(Base):
+    __tablename__ = "item"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    code: Mapped[str] = mapped_column(String(32), unique=True, nullable=False, index=True)
+    name: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+    category_id: Mapped[int | None] = mapped_column(ForeignKey("category.id"))
+    model: Mapped[str | None] = mapped_column(String(100))
+    status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="available", index=True
+    )  # available / borrowed / pending_scrap / scrapped
+    purchase_date: Mapped[date | None] = mapped_column(Date)
+    purchase_price: Mapped[Decimal | None] = mapped_column(Numeric(10, 2))
+    location: Mapped[str | None] = mapped_column(String(100))
+    qrcode_path: Mapped[str | None] = mapped_column(String(200))
+    remark: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+```
+
+---
+
+## `backend/models/scrap.py`
+
+```python
+"""报废记录表"""
+from datetime import datetime
+from sqlalchemy import String, DateTime, Text, ForeignKey
+from sqlalchemy.orm import Mapped, mapped_column
+
+from database import Base
+
+
+class ScrapRecord(Base):
+    __tablename__ = "scrap_record"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    item_id: Mapped[int] = mapped_column(ForeignKey("item.id"), nullable=False, index=True)
+    applicant_id: Mapped[int] = mapped_column(ForeignKey("user.id"), nullable=False)
+    approver_id: Mapped[int | None] = mapped_column(ForeignKey("user.id"))
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="pending"
+    )  # pending / approved / rejected
+    apply_time: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.now)
+    approve_time: Mapped[datetime | None] = mapped_column(DateTime)
+    approve_note: Mapped[str | None] = mapped_column(String(200))
+
+```
+
+---
+
+## `backend/models/user.py`
+
+```python
+"""用户表"""
+from datetime import datetime
+from sqlalchemy import String, Boolean, DateTime
+from sqlalchemy.orm import Mapped, mapped_column
+
+from database import Base
+
+
+class User(Base):
+    __tablename__ = "user"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    username: Mapped[str] = mapped_column(String(50), unique=True, nullable=False, index=True)
+    password_hash: Mapped[str] = mapped_column(String(128), nullable=False)
+    real_name: Mapped[str] = mapped_column(String(50), nullable=False)
+    role: Mapped[str] = mapped_column(String(20), nullable=False, default="student")  # admin / staff / student
+    phone: Mapped[str | None] = mapped_column(String(20))
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+```
+
+---
+
+## `backend/routers/__init__.py`
+
+```python
+
+```
+
+---
+
+## `backend/routers/auth.py`
+
+```python
+"""认证路由: /api/auth"""
+from fastapi import APIRouter, Depends, Response, Request
+from sqlalchemy.orm import Session
+
+from database import get_db
+from schemas.user import LoginRequest, UserOut
+from schemas.common import ApiResponse
+from services.user_service import authenticate
+from utils.auth import create_session, destroy_session
+from utils.deps import get_current_user
+from models.user import User
+
+router = APIRouter(prefix="/api/auth", tags=["认证"])
+
+
+@router.post("/login")
+def login(data: LoginRequest, response: Response, db: Session = Depends(get_db)):
+    user = authenticate(db, data.username, data.password)
+    if not user:
+        return ApiResponse(code=40101, msg="用户名或密码错误")
+
+    session_id = create_session(user.id, user.username, user.role, user.real_name)
+    response.set_cookie(
+        key="session_id",
+        value=session_id,
+        httponly=True,
+        samesite="lax",
+        max_age=86400,  # 24小时
+    )
+    return ApiResponse(data=UserOut.model_validate(user).model_dump())
+
+
+@router.post("/logout")
+def logout(request: Request, response: Response):
+    session_id = request.cookies.get("session_id")
+    if session_id:
+        destroy_session(session_id)
+    response.delete_cookie("session_id")
+    return ApiResponse(msg="已退出登录")
+
+
+@router.get("/me")
+def get_me(current_user: User = Depends(get_current_user)):
+    return ApiResponse(data=UserOut.model_validate(current_user).model_dump())
+
+```
+
+---
+
+## `backend/routers/borrows.py`
+
+```python
+"""借用路由: /api/borrows"""
+from fastapi import APIRouter, Depends, Query
+from sqlalchemy.orm import Session
+
+from database import get_db
+from schemas.common import ApiResponse, PaginatedData
+from schemas.borrow import BorrowCreate, BorrowReturn, BorrowOut
+from services import borrow_service
+from utils.deps import get_current_user, require_admin
+from models.user import User
+from models.item import Item
+
+router = APIRouter(prefix="/api/borrows", tags=["借用管理"])
+
+
+def _borrow_to_out(record, db: Session) -> dict:
+    """BorrowRecord ORM → 输出 dict"""
+    d = BorrowOut.model_validate(record).model_dump()
+    item = db.query(Item).filter_by(id=record.item_id).first()
+    user = db.query(User).filter_by(id=record.user_id).first()
+    d["item_name"] = item.name if item else ""
+    d["item_code"] = item.code if item else ""
+    d["user_name"] = user.real_name if user else ""
+    return d
+
+
+@router.post("")
+def create_borrow(data: BorrowCreate, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    try:
+        record = borrow_service.borrow_item(db, data, current_user)
+        return ApiResponse(data=_borrow_to_out(record, db))
+    except ValueError as e:
+        return ApiResponse(code=40003, msg=str(e))
+
+
+@router.put("/{borrow_id}/return")
+def return_borrow(
+    borrow_id: int,
+    data: BorrowReturn,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    try:
+        record = borrow_service.return_item(db, borrow_id, current_user, data.return_note)
+        return ApiResponse(data=_borrow_to_out(record, db))
+    except ValueError as e:
+        return ApiResponse(code=40003, msg=str(e))
+
+
+@router.get("")
+def list_borrows(
+    status: str | None = None,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    records, total = borrow_service.list_borrows(db, status, page, page_size)
+    return ApiResponse(data=PaginatedData(
+        items=[_borrow_to_out(r, db) for r in records],
+        total=total,
+        page=page,
+        page_size=page_size,
+    ).model_dump())
+
+
+@router.get("/my")
+def my_borrows(
+    status: str | None = None,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    records, total = borrow_service.my_borrows(db, current_user.id, status, page, page_size)
+    return ApiResponse(data=PaginatedData(
+        items=[_borrow_to_out(r, db) for r in records],
+        total=total,
+        page=page,
+        page_size=page_size,
+    ).model_dump())
+
+
+@router.get("/overdue")
+def overdue_list(db: Session = Depends(get_db), admin: User = Depends(require_admin)):
+    records = borrow_service.list_overdue(db)
+    return ApiResponse(data=[_borrow_to_out(r, db) for r in records])
+
+```
+
+---
+
+## `backend/routers/dashboard.py`
+
+```python
+"""仪表盘 & 报表路由: /api/dashboard"""
+from datetime import date
+from fastapi import APIRouter, Depends, Query
+from fastapi.responses import Response
+from sqlalchemy.orm import Session
+
+from database import get_db
+from schemas.common import ApiResponse
+from services import dashboard_service
+from utils.deps import get_current_user, require_admin
+from models.user import User
+
+router = APIRouter(prefix="/api/dashboard", tags=["仪表盘"])
+
+
+@router.get("/stats")
+def get_stats(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    data = dashboard_service.get_stats(db)
+    return ApiResponse(data=data)
+
+
+@router.get("/top-borrowed")
+def top_borrowed(
+    limit: int = Query(10, ge=1, le=50),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    data = dashboard_service.get_top_borrowed(db, limit)
+    return ApiResponse(data=data)
+
+
+@router.get("/reports/export")
+def export_report(
+    start_date: date | None = None,
+    end_date: date | None = None,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
+    csv_content = dashboard_service.export_borrow_report(db, start_date, end_date)
+    return Response(
+        content=csv_content.encode("utf-8-sig"),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=borrow_report.csv"},
+    )
+
+```
+
+---
+
+## `backend/routers/items.py`
+
+```python
+"""物品路由: /api/items"""
+import csv
+import io
+from fastapi import APIRouter, Depends, UploadFile, File, Query
+from fastapi.responses import FileResponse, Response
+from sqlalchemy.orm import Session
+
+from database import get_db
+from schemas.common import ApiResponse, PaginatedData
+from schemas.item import ItemCreate, ItemUpdate, ItemOut, QrcodePdfRequest
+from services import item_service
+from services.qrcode_service import generate_qrcode, generate_qrcode_pdf
+from services.borrow_service import get_borrow_history
+from utils.deps import get_current_user, require_admin
+from models.user import User
+
+router = APIRouter(prefix="/api/items", tags=["物品管理"])
+
+
+def _item_to_out(item, db: Session) -> dict:
+    """Item ORM → 输出 dict（含 category_name）"""
+    d = ItemOut.model_validate(item).model_dump()
+    d["category_name"] = item_service.get_category_name(db, item.category_id)
+    return d
+
+
+@router.post("")
+def create_item(data: ItemCreate, db: Session = Depends(get_db), admin: User = Depends(require_admin)):
+    try:
+        item = item_service.create_item(db, data)
+        # 生成二维码
+        qr_path = generate_qrcode(item.id, item.code)
+        item.qrcode_path = qr_path
+        db.commit()
+        db.refresh(item)
+        return ApiResponse(data=_item_to_out(item, db))
+    except ValueError as e:
+        return ApiResponse(code=40002, msg=str(e))
+
+
+@router.get("")
+def list_items(
+    keyword: str | None = None,
+    category_id: int | None = None,
+    status: str | None = None,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    items, total = item_service.list_items(db, keyword, category_id, status, page, page_size)
+    return ApiResponse(data=PaginatedData(
+        items=[_item_to_out(i, db) for i in items],
+        total=total,
+        page=page,
+        page_size=page_size,
+    ).model_dump())
+
+
+@router.get("/categories")
+def list_categories(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    cats = item_service.list_categories(db)
+    return ApiResponse(data=[{"id": c.id, "name": c.name, "description": c.description} for c in cats])
+
+
+@router.get("/{item_id}")
+def get_item(item_id: int, db: Session = Depends(get_db)):
+    item = item_service.get_item(db, item_id)
+    if not item:
+        return ApiResponse(code=40001, msg="物品不存在")
+
+    data = _item_to_out(item, db)
+    # 附加借用历史
+    history = get_borrow_history(db, item_id, limit=5)
+    from models.user import User as UserModel
+    data["borrow_history"] = []
+    for h in history:
+        u = db.query(UserModel).filter_by(id=h.user_id).first()
+        data["borrow_history"].append({
+            "id": h.id,
+            "user_name": u.real_name if u else "",
+            "borrow_date": h.borrow_date.isoformat() if h.borrow_date else "",
+            "due_date": str(h.due_date) if h.due_date else "",
+            "return_date": h.return_date.isoformat() if h.return_date else None,
+            "status": h.status,
+        })
+    return ApiResponse(data=data)
+
+
+@router.put("/{item_id}")
+def update_item(item_id: int, data: ItemUpdate, db: Session = Depends(get_db), admin: User = Depends(require_admin)):
+    try:
+        item = item_service.update_item(db, item_id, data)
+        return ApiResponse(data=_item_to_out(item, db))
+    except ValueError as e:
+        return ApiResponse(code=40001, msg=str(e))
+
+
+@router.delete("/{item_id}")
+def delete_item(item_id: int, db: Session = Depends(get_db), admin: User = Depends(require_admin)):
+    try:
+        item_service.delete_item(db, item_id)
+        return ApiResponse(msg="删除成功")
+    except ValueError as e:
+        return ApiResponse(code=40003, msg=str(e))
+
+
+@router.get("/{item_id}/qrcode")
+def get_qrcode(item_id: int, db: Session = Depends(get_db)):
+    item = item_service.get_item(db, item_id)
+    if not item:
+        return ApiResponse(code=40001, msg="物品不存在")
+    if not item.qrcode_path:
+        # 按需生成
+        qr_path = generate_qrcode(item.id, item.code)
+        item.qrcode_path = qr_path
+        db.commit()
+    return FileResponse(item.qrcode_path, media_type="image/png")
+
+
+@router.post("/qrcode-pdf")
+def batch_qrcode_pdf(data: QrcodePdfRequest, db: Session = Depends(get_db), admin: User = Depends(require_admin)):
+    items = []
+    for iid in data.item_ids:
+        item = item_service.get_item(db, iid)
+        if item:
+            if not item.qrcode_path:
+                item.qrcode_path = generate_qrcode(item.id, item.code)
+                db.commit()
+            items.append({"qrcode_path": item.qrcode_path, "name": item.name, "code": item.code})
+
+    if not items:
+        return ApiResponse(code=40001, msg="未找到有效物品")
+
+    pdf_path = generate_qrcode_pdf(items)
+    return FileResponse(pdf_path, media_type="application/pdf", filename="qrcodes.pdf")
+
+
+@router.post("/import")
+async def import_csv(file: UploadFile = File(...), db: Session = Depends(get_db), admin: User = Depends(require_admin)):
+    """CSV 批量导入物品"""
+    content = await file.read()
+    text = content.decode("utf-8-sig")
+    reader = csv.reader(io.StringIO(text))
+
+    created = 0
+    errors = []
+    for row_num, row in enumerate(reader, 1):
+        if row_num == 1 and row[0].startswith("名称"):
+            continue  # 跳过表头
+        if len(row) < 1:
+            continue
+        try:
+            # CSV: 名称,分类,型号,购入日期,价格,位置,备注
+            name = row[0].strip()
+            category_name = row[1].strip() if len(row) > 1 else ""
+            model_val = row[2].strip() if len(row) > 2 else None
+            purchase_date = row[3].strip() if len(row) > 3 else None
+            price = row[4].strip() if len(row) > 4 else None
+            location = row[5].strip() if len(row) > 5 else None
+            remark = row[6].strip() if len(row) > 6 else None
+
+            # 查找分类 ID
+            cat_id = None
+            if category_name:
+                from models.category import Category
+                cat = db.query(Category).filter_by(name=category_name).first()
+                if cat:
+                    cat_id = cat.id
+
+            from decimal import Decimal
+            from datetime import date as dt_date
+            item_data = ItemCreate(
+                name=name,
+                category_id=cat_id,
+                model=model_val or None,
+                purchase_date=dt_date.fromisoformat(purchase_date) if purchase_date else None,
+                purchase_price=Decimal(price) if price else None,
+                location=location or None,
+                remark=remark or None,
+            )
+            item = item_service.create_item(db, item_data)
+            qr_path = generate_qrcode(item.id, item.code)
+            item.qrcode_path = qr_path
+            db.commit()
+            created += 1
+        except Exception as e:
+            errors.append(f"第{row_num}行: {str(e)}")
+
+    return ApiResponse(data={"created": created, "errors": errors})
+
+```
+
+---
+
+## `backend/routers/scraps.py`
+
+```python
+"""报废路由: /api/scraps"""
+from fastapi import APIRouter, Depends, Query
+from sqlalchemy.orm import Session
+
+from database import get_db
+from schemas.common import ApiResponse, PaginatedData
+from schemas.scrap import ScrapCreate, ScrapApprove, ScrapOut
+from services import scrap_service
+from utils.deps import get_current_user, require_admin
+from models.user import User
+from models.item import Item
+
+router = APIRouter(prefix="/api/scraps", tags=["报废管理"])
+
+
+def _scrap_to_out(record, db: Session) -> dict:
+    """ScrapRecord ORM → 输出 dict"""
+    d = ScrapOut.model_validate(record).model_dump()
+    item = db.query(Item).filter_by(id=record.item_id).first()
+    applicant = db.query(User).filter_by(id=record.applicant_id).first()
+    d["item_name"] = item.name if item else ""
+    d["item_code"] = item.code if item else ""
+    d["applicant_name"] = applicant.real_name if applicant else ""
+    if record.approver_id:
+        approver = db.query(User).filter_by(id=record.approver_id).first()
+        d["approver_name"] = approver.real_name if approver else ""
+    return d
+
+
+@router.post("")
+def create_scrap(data: ScrapCreate, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    try:
+        record = scrap_service.apply_scrap(db, data.item_id, data.reason, current_user)
+        return ApiResponse(data=_scrap_to_out(record, db))
+    except ValueError as e:
+        return ApiResponse(code=40003, msg=str(e))
+
+
+@router.put("/{scrap_id}/approve")
+def approve_scrap(
+    scrap_id: int,
+    data: ScrapApprove,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
+    try:
+        record = scrap_service.approve_scrap(db, scrap_id, admin, data.approve_note)
+        return ApiResponse(data=_scrap_to_out(record, db))
+    except ValueError as e:
+        return ApiResponse(code=40003, msg=str(e))
+
+
+@router.put("/{scrap_id}/reject")
+def reject_scrap(
+    scrap_id: int,
+    data: ScrapApprove,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
+    try:
+        record = scrap_service.reject_scrap(db, scrap_id, admin, data.approve_note)
+        return ApiResponse(data=_scrap_to_out(record, db))
+    except ValueError as e:
+        return ApiResponse(code=40003, msg=str(e))
+
+
+@router.get("")
+def list_scraps(
+    status: str | None = None,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    records, total = scrap_service.list_scraps(db, status, page, page_size)
+    return ApiResponse(data=PaginatedData(
+        items=[_scrap_to_out(r, db) for r in records],
+        total=total,
+        page=page,
+        page_size=page_size,
+    ).model_dump())
+
+```
+
+---
+
+## `backend/routers/users.py`
+
+```python
+"""用户管理路由: /api/users"""
+from fastapi import APIRouter, Depends, Query
+from sqlalchemy.orm import Session
+
+from database import get_db
+from schemas.common import ApiResponse, PaginatedData
+from schemas.user import UserCreate, UserUpdate, UserOut
+from services import user_service
+from utils.deps import require_admin
+from models.user import User
+
+router = APIRouter(prefix="/api/users", tags=["用户管理"])
+
+
+@router.get("")
+def list_users(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
+    users, total = user_service.list_users(db, page, page_size)
+    return ApiResponse(data=PaginatedData(
+        items=[UserOut.model_validate(u).model_dump() for u in users],
+        total=total,
+        page=page,
+        page_size=page_size,
+    ).model_dump())
+
+
+@router.post("")
+def create_user(data: UserCreate, db: Session = Depends(get_db), admin: User = Depends(require_admin)):
+    try:
+        user = user_service.create_user(db, data)
+        return ApiResponse(data=UserOut.model_validate(user).model_dump())
+    except ValueError as e:
+        return ApiResponse(code=40002, msg=str(e))
+
+
+@router.put("/{user_id}")
+def update_user(user_id: int, data: UserUpdate, db: Session = Depends(get_db), admin: User = Depends(require_admin)):
+    try:
+        user = user_service.update_user(db, user_id, data)
+        return ApiResponse(data=UserOut.model_validate(user).model_dump())
+    except ValueError as e:
+        return ApiResponse(code=40001, msg=str(e))
+
+
+@router.put("/{user_id}/disable")
+def disable_user(user_id: int, db: Session = Depends(get_db), admin: User = Depends(require_admin)):
+    try:
+        user = user_service.disable_user(db, user_id)
+        return ApiResponse(data=UserOut.model_validate(user).model_dump())
+    except ValueError as e:
+        return ApiResponse(code=40001, msg=str(e))
+
+```
+
+---
+
+## `backend/schemas/__init__.py`
+
+```python
+"""Pydantic 请求/响应模型"""
+
+```
+
+---
+
+## `backend/schemas/borrow.py`
+
+```python
+"""借用相关 Schema"""
+from datetime import datetime, date
+from pydantic import BaseModel
+
+
+class BorrowCreate(BaseModel):
+    item_id: int
+    due_date: date
+    purpose: str | None = None
+
+
+class BorrowReturn(BaseModel):
+    return_note: str | None = None
+
+
+class BorrowOut(BaseModel):
+    id: int
+    item_id: int
+    item_name: str | None = None
+    item_code: str | None = None
+    user_id: int
+    user_name: str | None = None
+    borrow_date: datetime
+    due_date: date
+    return_date: datetime | None = None
+    status: str
+    purpose: str | None = None
+    return_note: str | None = None
+
+    model_config = {"from_attributes": True}
+
+```
+
+---
+
+## `backend/schemas/common.py`
+
+```python
+"""通用响应模型"""
+from typing import Any
+from pydantic import BaseModel
+
+
+class ApiResponse(BaseModel):
+    """统一响应格式"""
+    code: int = 0
+    data: Any = None
+    msg: str = "ok"
+
+
+class PaginatedData(BaseModel):
+    """分页数据"""
+    items: list = []
+    total: int = 0
+    page: int = 1
+    page_size: int = 20
+
+```
+
+---
+
+## `backend/schemas/item.py`
+
+```python
+"""物品相关 Schema"""
+from datetime import datetime, date
+from decimal import Decimal
+from pydantic import BaseModel
+
+
+class ItemCreate(BaseModel):
+    name: str
+    category_id: int | None = None
+    model: str | None = None
+    purchase_date: date | None = None
+    purchase_price: Decimal | None = None
+    location: str | None = None
+    remark: str | None = None
+
+
+class ItemUpdate(BaseModel):
+    name: str | None = None
+    category_id: int | None = None
+    model: str | None = None
+    purchase_date: date | None = None
+    purchase_price: Decimal | None = None
+    location: str | None = None
+    remark: str | None = None
+
+
+class ItemOut(BaseModel):
+    id: int
+    code: str
+    name: str
+    category_id: int | None = None
+    category_name: str | None = None
+    model: str | None = None
+    status: str
+    purchase_date: date | None = None
+    purchase_price: Decimal | None = None
+    location: str | None = None
+    qrcode_path: str | None = None
+    remark: str | None = None
+    created_at: datetime | None = None
+
+    model_config = {"from_attributes": True}
+
+
+class QrcodePdfRequest(BaseModel):
+    item_ids: list[int]
+
+```
+
+---
+
+## `backend/schemas/scrap.py`
+
+```python
+"""报废相关 Schema"""
+from datetime import datetime
+from pydantic import BaseModel
+
+
+class ScrapCreate(BaseModel):
+    item_id: int
+    reason: str
+
+
+class ScrapApprove(BaseModel):
+    approve_note: str | None = None
+
+
+class ScrapOut(BaseModel):
+    id: int
+    item_id: int
+    item_name: str | None = None
+    item_code: str | None = None
+    applicant_id: int
+    applicant_name: str | None = None
+    approver_id: int | None = None
+    approver_name: str | None = None
+    reason: str
+    status: str
+    apply_time: datetime
+    approve_time: datetime | None = None
+    approve_note: str | None = None
+
+    model_config = {"from_attributes": True}
+
+```
+
+---
+
+## `backend/schemas/user.py`
+
+```python
+"""用户相关 Schema"""
+from datetime import datetime
+from pydantic import BaseModel
+
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+class UserCreate(BaseModel):
+    username: str
+    password: str
+    real_name: str
+    role: str = "student"  # admin / staff / student
+    phone: str | None = None
+
+
+class UserUpdate(BaseModel):
+    real_name: str | None = None
+    role: str | None = None
+    phone: str | None = None
+    is_active: bool | None = None
+
+
+class UserOut(BaseModel):
+    id: int
+    username: str
+    real_name: str
+    role: str
+    phone: str | None = None
+    is_active: bool = True
+    created_at: datetime | None = None
+
+    model_config = {"from_attributes": True}
+
+```
+
+---
+
+## `backend/services/__init__.py`
+
+```python
+
+```
+
+---
+
+## `backend/services/borrow_service.py`
+
+```python
+"""借用业务逻辑"""
+from datetime import datetime, date, timedelta
+from sqlalchemy.orm import Session
+
+from models.borrow import BorrowRecord
+from models.item import Item
+from models.user import User
+from schemas.borrow import BorrowCreate
+
+
+def borrow_item(db: Session, data: BorrowCreate, user: User) -> BorrowRecord:
+    """发起借用"""
+    item = db.query(Item).filter_by(id=data.item_id).first()
+    if not item:
+        raise ValueError("物品不存在")
+    if item.status != "available":
+        raise ValueError(f"物品当前状态为「{item.status}」，不可借用")
+
+    # 检查 due_date
+    if data.due_date < date.today():
+        raise ValueError("归还日期不能早于今天")
+    if data.due_date > date.today() + timedelta(days=90):
+        raise ValueError("借期最长 90 天")
+
+    # 检查用户未归还数量
+    active_count = (
+        db.query(BorrowRecord)
+        .filter_by(user_id=user.id, status="active")
+        .count()
+    )
+    if active_count >= 10:
+        raise ValueError("您当前未归还物品已达上限（10件）")
+
+    # 事务：插入借用记录 + 更新物品状态
+    record = BorrowRecord(
+        item_id=data.item_id,
+        user_id=user.id,
+        due_date=data.due_date,
+        purpose=data.purpose,
+        status="active",
+    )
+    item.status = "borrowed"
+
+    db.add(record)
+    db.commit()
+    db.refresh(record)
+    return record
+
+
+def return_item(db: Session, borrow_id: int, user: User, return_note: str | None = None) -> BorrowRecord:
+    """归还物品"""
+    record = db.query(BorrowRecord).filter_by(id=borrow_id).first()
+    if not record:
+        raise ValueError("借用记录不存在")
+    if record.status == "returned":
+        raise ValueError("该借用记录已归还")
+
+    # 权限：本人或管理员
+    if record.user_id != user.id and user.role != "admin":
+        raise ValueError("只能归还自己的借用记录")
+
+    record.status = "returned"
+    record.return_date = datetime.now()
+    record.return_note = return_note
+
+    # 恢复物品状态（如果物品不是待报废）
+    item = db.query(Item).filter_by(id=record.item_id).first()
+    if item and item.status == "borrowed":
+        item.status = "available"
+
+    db.commit()
+    db.refresh(record)
+    return record
+
+
+def list_borrows(
+    db: Session,
+    status: str | None = None,
+    page: int = 1,
+    page_size: int = 20,
+):
+    """所有借用记录"""
+    q = db.query(BorrowRecord)
+    if status:
+        q = q.filter(BorrowRecord.status == status)
+
+    total = q.count()
+    records = (
+        q.order_by(BorrowRecord.id.desc())
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+        .all()
+    )
+    return records, total
+
+
+def my_borrows(
+    db: Session,
+    user_id: int,
+    status: str | None = None,
+    page: int = 1,
+    page_size: int = 20,
+):
+    """我的借用记录"""
+    q = db.query(BorrowRecord).filter_by(user_id=user_id)
+    if status:
+        q = q.filter(BorrowRecord.status == status)
+
+    total = q.count()
+    records = (
+        q.order_by(BorrowRecord.id.desc())
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+        .all()
+    )
+    return records, total
+
+
+def list_overdue(db: Session):
+    """逾期列表"""
+    return (
+        db.query(BorrowRecord)
+        .filter(
+            BorrowRecord.status.in_(["active", "overdue"]),
+            BorrowRecord.due_date < date.today(),
+        )
+        .order_by(BorrowRecord.due_date)
+        .all()
+    )
+
+
+def mark_overdue(db: Session):
+    """定时任务：标记逾期"""
+    records = (
+        db.query(BorrowRecord)
+        .filter(
+            BorrowRecord.status == "active",
+            BorrowRecord.due_date < date.today(),
+        )
+        .all()
+    )
+    for r in records:
+        r.status = "overdue"
+    db.commit()
+    return len(records)
+
+
+def get_borrow_history(db: Session, item_id: int, limit: int = 5):
+    """物品的借用历史"""
+    return (
+        db.query(BorrowRecord)
+        .filter_by(item_id=item_id)
+        .order_by(BorrowRecord.id.desc())
+        .limit(limit)
+        .all()
+    )
+
+```
+
+---
+
+## `backend/services/dashboard_service.py`
+
+```python
+"""仪表盘 & 报表业务逻辑"""
+import csv
+import io
+from datetime import date
+from sqlalchemy import func
+from sqlalchemy.orm import Session
+
+from models.item import Item
+from models.borrow import BorrowRecord
+from models.user import User
+
+
+def get_stats(db: Session) -> dict:
+    """统计概览"""
+    total = db.query(Item).count()
+    available = db.query(Item).filter_by(status="available").count()
+    borrowed = db.query(Item).filter_by(status="borrowed").count()
+    scrapped = db.query(Item).filter_by(status="scrapped").count()
+
+    overdue = (
+        db.query(BorrowRecord)
+        .filter(
+            BorrowRecord.status.in_(["active", "overdue"]),
+            BorrowRecord.due_date < date.today(),
+        )
+        .count()
+    )
+
+    return {
+        "total_items": total,
+        "available_count": available,
+        "borrowed_count": borrowed,
+        "overdue_count": overdue,
+        "scrapped_count": scrapped,
+    }
+
+
+def get_top_borrowed(db: Session, limit: int = 10) -> list:
+    """借用频次 Top N"""
+    results = (
+        db.query(
+            BorrowRecord.item_id,
+            Item.name,
+            Item.code,
+            func.count(BorrowRecord.id).label("borrow_count"),
+        )
+        .join(Item, BorrowRecord.item_id == Item.id)
+        .group_by(BorrowRecord.item_id)
+        .order_by(func.count(BorrowRecord.id).desc())
+        .limit(limit)
+        .all()
+    )
+    return [
+        {
+            "item_id": r.item_id,
+            "name": r.name,
+            "code": r.code,
+            "borrow_count": r.borrow_count,
+        }
+        for r in results
+    ]
+
+
+def export_borrow_report(db: Session, start_date: date | None = None, end_date: date | None = None) -> str:
+    """导出借用报表 CSV，返回 CSV 字符串"""
+    q = db.query(BorrowRecord).join(Item, BorrowRecord.item_id == Item.id).join(User, BorrowRecord.user_id == User.id)
+
+    if start_date:
+        q = q.filter(BorrowRecord.borrow_date >= start_date)
+    if end_date:
+        q = q.filter(BorrowRecord.borrow_date <= end_date)
+
+    records = q.order_by(BorrowRecord.borrow_date.desc()).all()
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["借用ID", "物品编号", "物品名称", "借用人", "借出日期", "应还日期", "实际归还", "状态", "用途"])
+
+    for r in records:
+        item = db.query(Item).filter_by(id=r.item_id).first()
+        user = db.query(User).filter_by(id=r.user_id).first()
+        writer.writerow([
+            r.id,
+            item.code if item else "",
+            item.name if item else "",
+            user.real_name if user else "",
+            r.borrow_date.strftime("%Y-%m-%d") if r.borrow_date else "",
+            str(r.due_date) if r.due_date else "",
+            r.return_date.strftime("%Y-%m-%d") if r.return_date else "未归还",
+            r.status,
+            r.purpose or "",
+        ])
+
+    return output.getvalue()
+
+```
+
+---
+
+## `backend/services/item_service.py`
+
+```python
+"""物品业务逻辑"""
+from datetime import date
+from sqlalchemy.orm import Session
+from sqlalchemy import func
+
+from models.item import Item
+from models.category import Category
+from schemas.item import ItemCreate, ItemUpdate
+
+
+def generate_item_code(db: Session) -> str:
+    """生成物品编号: ITM-YYYYMMDD-XXXX"""
+    today = date.today().strftime("%Y%m%d")
+    prefix = f"ITM-{today}-"
+
+    # 查询当天最大编号
+    last = (
+        db.query(Item.code)
+        .filter(Item.code.like(f"{prefix}%"))
+        .order_by(Item.code.desc())
+        .first()
+    )
+
+    if last:
+        seq = int(last[0].split("-")[-1]) + 1
+    else:
+        seq = 1
+
+    return f"{prefix}{seq:04d}"
+
+
+def create_item(db: Session, data: ItemCreate) -> Item:
+    """录入物品"""
+    # 校验分类存在
+    if data.category_id:
+        cat = db.query(Category).filter_by(id=data.category_id).first()
+        if not cat:
+            raise ValueError("分类不存在")
+
+    code = generate_item_code(db)
+    item = Item(
+        code=code,
+        name=data.name,
+        category_id=data.category_id,
+        model=data.model,
+        status="available",
+        purchase_date=data.purchase_date,
+        purchase_price=data.purchase_price,
+        location=data.location,
+        remark=data.remark,
+    )
+    db.add(item)
+    db.commit()
+    db.refresh(item)
+    return item
+
+
+def get_item(db: Session, item_id: int) -> Item | None:
+    """获取单个物品"""
+    return db.query(Item).filter_by(id=item_id).first()
+
+
+def list_items(
+    db: Session,
+    keyword: str | None = None,
+    category_id: int | None = None,
+    status: str | None = None,
+    page: int = 1,
+    page_size: int = 20,
+):
+    """分页查询物品列表"""
+    q = db.query(Item)
+
+    if keyword:
+        q = q.filter(
+            (Item.name.contains(keyword)) | (Item.code.contains(keyword))
+        )
+    if category_id:
+        q = q.filter(Item.category_id == category_id)
+    if status:
+        q = q.filter(Item.status == status)
+
+    total = q.count()
+    items = (
+        q.order_by(Item.id.desc())
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+        .all()
+    )
+    return items, total
+
+
+def update_item(db: Session, item_id: int, data: ItemUpdate) -> Item:
+    """更新物品"""
+    item = db.query(Item).filter_by(id=item_id).first()
+    if not item:
+        raise ValueError("物品不存在")
+
+    for field, value in data.model_dump(exclude_unset=True).items():
+        setattr(item, field, value)
+
+    db.commit()
+    db.refresh(item)
+    return item
+
+
+def delete_item(db: Session, item_id: int):
+    """删除物品"""
+    item = db.query(Item).filter_by(id=item_id).first()
+    if not item:
+        raise ValueError("物品不存在")
+    if item.status == "borrowed":
+        raise ValueError("物品正在借出中，不能删除")
+
+    db.delete(item)
+    db.commit()
+
+
+def get_category_name(db: Session, category_id: int | None) -> str | None:
+    """获取分类名称"""
+    if not category_id:
+        return None
+    cat = db.query(Category).filter_by(id=category_id).first()
+    return cat.name if cat else None
+
+
+def list_categories(db: Session):
+    """获取所有分类"""
+    return db.query(Category).all()
+
+```
+
+---
+
+## `backend/services/qrcode_service.py`
+
+```python
+"""二维码生成 & PDF 导出"""
+import os
+import qrcode
+from datetime import datetime
+from reportlab.lib.pagesizes import A4
+from reportlab.pdfgen import canvas
+
+from config import SERVER_HOST, QRCODE_DIR, EXPORT_DIR
+
+
+def generate_qrcode(item_id: int, item_code: str) -> str:
+    """生成二维码图片，返回保存路径"""
+    os.makedirs(QRCODE_DIR, exist_ok=True)
+
+    url = f"http://{SERVER_HOST}/items/{item_id}"
+
+    qr = qrcode.QRCode(version=1, box_size=10, border=2)
+    qr.add_data(url)
+    qr.make(fit=True)
+    img = qr.make_image(fill_color="black", back_color="white")
+
+    path = os.path.join(QRCODE_DIR, f"{item_code}.png")
+    img.save(path)
+    return path
+
+
+def generate_qrcode_pdf(items: list) -> str:
+    """生成包含多个物品二维码的 PDF
+    
+    items: list of dicts with keys: qrcode_path, name, code
+    """
+    os.makedirs(EXPORT_DIR, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+    pdf_path = os.path.join(EXPORT_DIR, f"qrcodes_{timestamp}.pdf")
+
+    c = canvas.Canvas(pdf_path, pagesize=A4)
+    width, height = A4
+    cols, rows = 2, 4  # 每页 2列 x 4行
+    cell_w = width / cols
+    cell_h = height / rows
+
+    for i, item in enumerate(items):
+        page_idx = i % (cols * rows)
+        if page_idx == 0 and i > 0:
+            c.showPage()
+
+        col = page_idx % cols
+        row = page_idx // cols
+
+        x = col * cell_w + 20
+        y = height - (row + 1) * cell_h + 20
+
+        # 画二维码图片
+        qr_path = item.get("qrcode_path") or ""
+        if os.path.exists(qr_path):
+            c.drawImage(qr_path, x, y + 30, 80, 80)
+
+        # 物品名称
+        c.setFont("Helvetica", 10)
+        c.drawString(x, y + 15, item.get("name", ""))
+        # 物品编号
+        c.setFont("Helvetica", 8)
+        c.drawString(x, y, item.get("code", ""))
+
+    c.save()
+    return pdf_path
+
+```
+
+---
+
+## `backend/services/scrap_service.py`
+
+```python
+"""报废业务逻辑"""
+from datetime import datetime
+from sqlalchemy.orm import Session
+
+from models.scrap import ScrapRecord
+from models.item import Item
+from models.user import User
+
+
+def apply_scrap(db: Session, item_id: int, reason: str, applicant: User) -> ScrapRecord:
+    """发起报废申请"""
+    item = db.query(Item).filter_by(id=item_id).first()
+    if not item:
+        raise ValueError("物品不存在")
+    if item.status == "scrapped":
+        raise ValueError("物品已报废")
+    if item.status == "pending_scrap":
+        raise ValueError("物品已有待审批的报废申请")
+
+    # 检查是否已有 pending 的报废申请
+    existing = (
+        db.query(ScrapRecord)
+        .filter_by(item_id=item_id, status="pending")
+        .first()
+    )
+    if existing:
+        raise ValueError("该物品已有待审批的报废申请")
+
+    record = ScrapRecord(
+        item_id=item_id,
+        applicant_id=applicant.id,
+        reason=reason,
+        status="pending",
+    )
+    item.status = "pending_scrap"
+
+    db.add(record)
+    db.commit()
+    db.refresh(record)
+    return record
+
+
+def approve_scrap(db: Session, scrap_id: int, approver: User, approve_note: str | None = None) -> ScrapRecord:
+    """审批通过报废"""
+    record = db.query(ScrapRecord).filter_by(id=scrap_id).first()
+    if not record:
+        raise ValueError("报废记录不存在")
+    if record.status != "pending":
+        raise ValueError("该申请不在待审批状态")
+
+    record.status = "approved"
+    record.approver_id = approver.id
+    record.approve_time = datetime.now()
+    record.approve_note = approve_note
+
+    # 物品状态 → scrapped
+    item = db.query(Item).filter_by(id=record.item_id).first()
+    if item:
+        item.status = "scrapped"
+
+    db.commit()
+    db.refresh(record)
+    return record
+
+
+def reject_scrap(db: Session, scrap_id: int, approver: User, approve_note: str | None = None) -> ScrapRecord:
+    """审批驳回报废"""
+    record = db.query(ScrapRecord).filter_by(id=scrap_id).first()
+    if not record:
+        raise ValueError("报废记录不存在")
+    if record.status != "pending":
+        raise ValueError("该申请不在待审批状态")
+
+    record.status = "rejected"
+    record.approver_id = approver.id
+    record.approve_time = datetime.now()
+    record.approve_note = approve_note
+
+    # 恢复物品状态
+    item = db.query(Item).filter_by(id=record.item_id).first()
+    if item and item.status == "pending_scrap":
+        # 检查是否有活跃借用记录来决定恢复什么状态
+        from models.borrow import BorrowRecord
+        active_borrow = (
+            db.query(BorrowRecord)
+            .filter_by(item_id=item.id, status="active")
+            .first()
+        )
+        item.status = "borrowed" if active_borrow else "available"
+
+    db.commit()
+    db.refresh(record)
+    return record
+
+
+def list_scraps(
+    db: Session,
+    status: str | None = None,
+    page: int = 1,
+    page_size: int = 20,
+):
+    """报废申请列表"""
+    q = db.query(ScrapRecord)
+    if status:
+        q = q.filter(ScrapRecord.status == status)
+
+    total = q.count()
+    records = (
+        q.order_by(ScrapRecord.id.desc())
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+        .all()
+    )
+    return records, total
+
+```
+
+---
+
+## `backend/services/user_service.py`
+
+```python
+"""用户业务逻辑"""
+from sqlalchemy.orm import Session
+
+from models.user import User
+from schemas.user import UserCreate, UserUpdate
+from utils.auth import hash_password, verify_password
+
+
+def authenticate(db: Session, username: str, password: str) -> User | None:
+    """验证用户名密码，成功返回 User，失败返回 None"""
+    user = db.query(User).filter_by(username=username).first()
+    if not user or not user.is_active:
+        return None
+    if not verify_password(password, user.password_hash):
+        return None
+    return user
+
+
+def create_user(db: Session, data: UserCreate) -> User:
+    """创建用户"""
+    existing = db.query(User).filter_by(username=data.username).first()
+    if existing:
+        raise ValueError(f"用户名 '{data.username}' 已存在")
+
+    user = User(
+        username=data.username,
+        password_hash=hash_password(data.password),
+        real_name=data.real_name,
+        role=data.role,
+        phone=data.phone,
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return user
+
+
+def update_user(db: Session, user_id: int, data: UserUpdate) -> User:
+    """更新用户信息"""
+    user = db.query(User).filter_by(id=user_id).first()
+    if not user:
+        raise ValueError("用户不存在")
+
+    for field, value in data.model_dump(exclude_unset=True).items():
+        setattr(user, field, value)
+
+    db.commit()
+    db.refresh(user)
+    return user
+
+
+def list_users(db: Session, page: int = 1, page_size: int = 20):
+    """分页查询用户列表"""
+    total = db.query(User).count()
+    users = (
+        db.query(User)
+        .order_by(User.id)
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+        .all()
+    )
+    return users, total
+
+
+def disable_user(db: Session, user_id: int) -> User:
+    """禁用用户"""
+    user = db.query(User).filter_by(id=user_id).first()
+    if not user:
+        raise ValueError("用户不存在")
+    user.is_active = False
+    db.commit()
+    db.refresh(user)
+    return user
+
+```
+
+---
+
+## `backend/utils/__init__.py`
+
+```python
+
+```
+
+---
+
+## `backend/utils/auth.py`
+
+```python
+"""Session 认证工具 — 基于 Cookie 的 Session 管理"""
+import hashlib
+import uuid
+from datetime import datetime
+
+
+def hash_password(password: str) -> str:
+    """密码哈希 (SHA256)"""
+    return hashlib.sha256(password.encode()).hexdigest()
+
+
+def verify_password(plain: str, hashed: str) -> bool:
+    """验证密码"""
+    return hash_password(plain) == hashed
+
+
+def generate_session_id() -> str:
+    """生成随机 Session ID"""
+    return uuid.uuid4().hex
+
+
+# 内存 Session 存储 — 单机够用，重启后需重新登录
+# 格式: {session_id: {"user_id": int, "username": str, "role": str, "created": datetime}}
+_sessions: dict[str, dict] = {}
+
+
+def create_session(user_id: int, username: str, role: str, real_name: str) -> str:
+    """创建 Session，返回 session_id"""
+    sid = generate_session_id()
+    _sessions[sid] = {
+        "user_id": user_id,
+        "username": username,
+        "role": role,
+        "real_name": real_name,
+        "created": datetime.now(),
+    }
+    return sid
+
+
+def get_session(session_id: str) -> dict | None:
+    """根据 session_id 获取 Session 数据"""
+    return _sessions.get(session_id)
+
+
+def destroy_session(session_id: str):
+    """销毁 Session"""
+    _sessions.pop(session_id, None)
+
+```
+
+---
+
+## `backend/utils/deps.py`
+
+```python
+"""FastAPI 依赖注入"""
+from fastapi import Request, Depends, HTTPException
+from sqlalchemy.orm import Session
+
+from database import get_db
+from utils.auth import get_session
+from models.user import User
+
+
+def get_current_user(request: Request, db: Session = Depends(get_db)) -> User:
+    """从 Cookie 中读取 session_id，获取当前登录用户"""
+    session_id = request.cookies.get("session_id")
+    if not session_id:
+        raise HTTPException(status_code=401, detail="未登录")
+
+    session_data = get_session(session_id)
+    if not session_data:
+        raise HTTPException(status_code=401, detail="Session 已过期，请重新登录")
+
+    user = db.query(User).filter_by(id=session_data["user_id"]).first()
+    if not user or not user.is_active:
+        raise HTTPException(status_code=401, detail="用户不存在或已禁用")
+
+    return user
+
+
+def require_admin(current_user: User = Depends(get_current_user)) -> User:
+    """要求管理员权限"""
+    if current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="权限不足，需要管理员权限")
+    return current_user
+
+```
+
+---
+
+
+============================================================
+backend/config.py
+============================================================
+"""应用配置"""
+import os
+
+# 数据库路径
+DB_PATH = os.getenv("DB_PATH", "data/school_qr.db")
+DATABASE_URL = f"sqlite:///{DB_PATH}"
+
+# Session 密钥
+SESSION_SECRET = os.getenv("SESSION_SECRET", "dev-secret-change-in-prod")
+
+# 服务端口
+API_PORT = int(os.getenv("API_PORT", "8000"))
+
+# 二维码中的服务器地址（扫码后跳转用）
+SERVER_HOST = os.getenv("SERVER_HOST", "localhost:8080")
+
+# 静态文件目录
+STATIC_DIR = os.getenv("STATIC_DIR", "static")
+QRCODE_DIR = os.path.join(STATIC_DIR, "qrcodes")
+EXPORT_DIR = os.path.join(STATIC_DIR, "exports")
+
+============================================================
+backend/database.py
+============================================================
+"""SQLAlchemy 引擎 & Session 管理"""
+import os
+from sqlalchemy import create_engine, event
+from sqlalchemy.orm import sessionmaker, DeclarativeBase
+
+from config import DATABASE_URL, DB_PATH
+
+
+class Base(DeclarativeBase):
+    """ORM 基类"""
+    pass
+
+
+# 确保数据库目录存在
+os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
+
+# 创建引擎（SQLite 开启 WAL 模式提升并发性能）
+engine = create_engine(
+    DATABASE_URL,
+    connect_args={"check_same_thread": False},
+    echo=False,
+)
+
+
+# SQLite 开启外键约束
+@event.listens_for(engine, "connect")
+def _set_sqlite_pragma(dbapi_conn, connection_record):
+    cursor = dbapi_conn.cursor()
+    cursor.execute("PRAGMA journal_mode=WAL")
+    cursor.execute("PRAGMA foreign_keys=ON")
+    cursor.close()
+
+
+# Session 工厂
+SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+
+
+def get_db():
+    """FastAPI 依赖注入：获取数据库 Session"""
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+def init_db():
+    """建表（如果不存在）"""
+    import models  # noqa: F401 — 触发所有 model 注册
+    Base.metadata.create_all(bind=engine)
+
+============================================================
+backend/init_db.py
+============================================================
+"""初始化数据库：建表 + 插入默认数据"""
+import hashlib
+from database import init_db, SessionLocal
+from models import User, Category
+
+
+def hash_password(password: str) -> str:
+    """简单密码哈希（SHA256），生产环境建议用 bcrypt"""
+    return hashlib.sha256(password.encode()).hexdigest()
+
+
+def seed_data():
+    """插入默认管理员和常用分类"""
+    db = SessionLocal()
+    try:
+        # 默认管理员（如果不存在）
+        if not db.query(User).filter_by(username="admin").first():
+            admin = User(
+                username="admin",
+                password_hash=hash_password("admin123"),
+                real_name="系统管理员",
+                role="admin",
+            )
+            db.add(admin)
+            print("  ✓ 创建默认管理员: admin / admin123")
+
+        # 测试用户
+        test_users = [
+            ("teacher1", "teacher1", "张老师", "staff"),
+            ("student1", "student1", "李同学", "student"),
+        ]
+        for uname, pwd, rname, role in test_users:
+            if not db.query(User).filter_by(username=uname).first():
+                db.add(User(
+                    username=uname,
+                    password_hash=hash_password(pwd),
+                    real_name=rname,
+                    role=role,
+                ))
+                print(f"  ✓ 创建测试用户: {uname} / {pwd} ({role})")
+
+        # 默认分类
+        default_categories = [
+            ("电子设备", "电脑、投影仪、平板等"),
+            ("体育器材", "篮球、足球、羽毛球拍等"),
+            ("实验器材", "显微镜、烧杯、万用表等"),
+            ("办公用品", "打印机、订书机、白板等"),
+            ("图书", "教材、参考书、期刊等"),
+            ("教学器材", "教具、模型、挂图等"),
+        ]
+        for name, desc in default_categories:
+            if not db.query(Category).filter_by(name=name).first():
+                db.add(Category(name=name, description=desc))
+                print(f"  ✓ 创建分类: {name}")
+
+        db.commit()
+    finally:
+        db.close()
+
+
+if __name__ == "__main__":
+    print("=== 初始化数据库 ===")
+    print("1. 建表...")
+    init_db()
+    print("  ✓ 所有表创建完成")
+    print("2. 插入默认数据...")
+    seed_data()
+    print("=== 初始化完成 ===")
+
+============================================================
+backend/main.py
+============================================================
+"""FastAPI 后端入口"""
+import os
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from apscheduler.schedulers.background import BackgroundScheduler
+
+from config import API_PORT, STATIC_DIR, QRCODE_DIR, EXPORT_DIR
+from database import init_db, SessionLocal
+from services.borrow_service import mark_overdue
+
+# 确保静态目录存在
+for d in [STATIC_DIR, QRCODE_DIR, EXPORT_DIR]:
+    os.makedirs(d, exist_ok=True)
+
+
+# --- 定时任务：逾期标记 ---
+scheduler = BackgroundScheduler()
+
+
+def _run_overdue_check():
+    """每天检查逾期借用"""
+    db = SessionLocal()
+    try:
+        count = mark_overdue(db)
+        if count:
+            print(f"[定时任务] 标记 {count} 条逾期借用记录")
+    finally:
+        db.close()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # 启动时
+    init_db()
+    print("✓ 数据库初始化完成")
+    scheduler.add_job(_run_overdue_check, "cron", hour=1, minute=0)
+    scheduler.start()
+    print("✓ 逾期检测定时任务已启动 (每天 01:00)")
+    yield
+    # 关闭时
+    scheduler.shutdown()
+
+
+# --- FastAPI 应用 ---
+app = FastAPI(
+    title="学校物品二维码管理系统",
+    description="物品录入→借出→归还→报废 全生命周期管理",
+    version="1.0.0",
+    lifespan=lifespan,
+)
+
+# CORS（前端 NiceGUI 可能跑在不同端口）
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# 静态文件（二维码图片等）
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+# --- 注册路由 ---
+from routers.auth import router as auth_router
+from routers.items import router as items_router
+from routers.borrows import router as borrows_router
+from routers.scraps import router as scraps_router
+from routers.users import router as users_router
+from routers.dashboard import router as dashboard_router
+
+app.include_router(auth_router)
+app.include_router(items_router)
+app.include_router(borrows_router)
+app.include_router(scraps_router)
+app.include_router(users_router)
+app.include_router(dashboard_router)
+
+
+@app.get("/")
+def root():
+    return {"msg": "学校物品二维码管理系统 API", "docs": "/docs"}
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=API_PORT, reload=True)
+
+============================================================
+backend/seed_test_data.py
+============================================================
+"""清理物品表并插入完整的多分类测试数据"""
+import hashlib
+from datetime import date, datetime
+from database import init_db, SessionLocal
+from models import User, Category, Item, BorrowRecord, ScrapRecord
+from services.qrcode_service import generate_qrcode
+
+
+def hash_password(password: str) -> str:
+    return hashlib.sha256(password.encode()).hexdigest()
+
+
+def run():
+    db = SessionLocal()
+    try:
+        # ========== 1. 清理旧数据 ==========
+        db.query(ScrapRecord).delete()
+        db.query(BorrowRecord).delete()
+        db.query(Item).delete()
+        db.query(Category).delete()
+        db.query(User).delete()
+        db.commit()
+        print("✓ 已清理所有旧数据")
+
+        # ========== 2. 重建用户 ==========
+        users = [
+            ("admin", "admin123", "系统管理员", "admin", "13800000000"),
+            ("teacher1", "teacher1", "张老师", "staff", "13811111111"),
+            ("teacher2", "teacher2", "王老师", "staff", "13822222222"),
+            ("student1", "student1", "李同学", "student", "13900000001"),
+            ("student2", "student2", "赵同学", "student", "13900000002"),
+            ("student3", "student3", "陈同学", "student", "13900000003"),
+        ]
+        user_map = {}
+        for uname, pwd, rname, role, phone in users:
+            u = User(username=uname, password_hash=hash_password(pwd),
+                     real_name=rname, role=role, phone=phone)
+            db.add(u)
+            db.flush()
+            user_map[uname] = u.id
+            print(f"  ✓ 用户: {uname} / {pwd} ({role})")
+
+        # ========== 3. 重建分类 ==========
+        categories_data = [
+            ("电子设备", "电脑、投影仪、平板等"),
+            ("体育器材", "篮球、足球、羽毛球拍等"),
+            ("实验器材", "显微镜、烧杯、万用表等"),
+            ("办公用品", "打印机、订书机、白板等"),
+            ("图书", "教材、参考书、期刊等"),
+            ("教学器材", "教具、模型、挂图等"),
+            ("乐器", "钢琴、吉他、小提琴等"),
+            ("家具", "课桌、椅子、书柜等"),
+        ]
+        cat_map = {}
+        for name, desc in categories_data:
+            c = Category(name=name, description=desc)
+            db.add(c)
+            db.flush()
+            cat_map[name] = c.id
+            print(f"  ✓ 分类: {name}")
+
+        # ========== 4. 插入测试物品 ==========
+        seq = 0
+
+        def make_code():
+            nonlocal seq
+            seq += 1
+            return f"ITM-20260424-{seq:04d}"
+
+        items_data = [
+            # --- 电子设备 ---
+            ("EPSON CB-X06 投影仪", "电子设备", "EPSON CB-X06", "2023-09-01", 3599.00, "教学楼A栋 301室", "3600流明，XGA分辨率，含遥控器"),
+            ("联想ThinkPad E14 笔记本", "电子设备", "ThinkPad E14 Gen5", "2024-03-15", 4299.00, "计算机实验室 201室", "i5-13500H/16G/512G，教师办公用"),
+            ("iPad Air (第5代)", "电子设备", "iPad Air M1 64GB", "2024-06-01", 4399.00, "信息中心 105室", "教学演示用，含Apple Pencil"),
+            ("Dell P2422H 显示器", "电子设备", "P2422H 24寸", "2023-06-15", 1299.00, "办公楼 302室", "IPS面板，旋转升降支架"),
+            ("佳能PIXMA G3810打印机", "电子设备", "Canon G3810", "2024-01-10", 999.00, "教务处 101室", "彩色喷墨，无线打印"),
+
+            # --- 体育器材 ---
+            ("摩腾GG7X 篮球", "体育器材", "Molten GG7X", "2024-04-15", 189.00, "体育器材室", "比赛用球，共10个"),
+            ("红双喜DHS 乒乓球拍", "体育器材", "DHS 6星横拍", "2024-02-20", 299.00, "体育器材室", "套装含3个球"),
+            ("尤尼克斯羽毛球拍", "体育器材", "YONEX ARC-7", "2023-11-08", 459.00, "体育器材室", "全碳素，含拍包"),
+            ("跳绳（计数款）", "体育器材", "Li-Ning AQAH182", "2024-03-01", 39.00, "体育器材室", "电子计数，钢丝绳，共20根"),
+            ("足球（5号）", "体育器材", "STAR SB515", "2024-05-10", 129.00, "体育器材室", "PU材质比赛球，共8个"),
+
+            # --- 实验器材 ---
+            ("生物显微镜", "实验器材", "Olympus CX23", "2022-09-01", 6800.00, "生物实验室 401室", "双目，40X-1000X"),
+            ("数字万用表", "实验器材", "Fluke 15B+", "2023-03-20", 580.00, "物理实验室 302室", "自动量程，共15台"),
+            ("电子天平", "实验器材", "梅特勒 ME204", "2023-06-15", 4200.00, "化学实验室 501室", "0.1mg精度，220g量程"),
+            ("示波器", "实验器材", "Rigol DS1054Z", "2022-12-10", 2800.00, "电子实验室 203室", "50MHz 4通道"),
+
+            # --- 办公用品 ---
+            ("得力碎纸机", "办公用品", "Deli 9939", "2024-01-20", 699.00, "行政办公室 201室", "4级保密，15张/次"),
+            ("白板（磁性）", "办公用品", "120x90cm 双面", "2023-09-01", 189.00, "会议室 A301", "含白板笔和磁扣套装"),
+            ("考勤机", "办公用品", "中控 ZKTeco K40", "2024-02-01", 399.00, "校门口门卫室", "指纹+刷卡，容量3000人"),
+
+            # --- 图书 ---
+            ("高等数学（第七版）上册", "图书", "ISBN 978-7-04-039663-8", "2024-03-15", 34.90, "图书馆 A区 3层 12架", "同济大学版，共50本"),
+            ("Python编程：从入门到实践（第3版）", "图书", "ISBN 978-7-115-57614-2", "2024-06-01", 89.80, "图书馆 B区 2层 05架", "人民邮电出版社"),
+            ("新概念英语（第二册）", "图书", "ISBN 978-7-5600-1346-1", "2023-09-10", 29.90, "图书馆 A区 1层 08架", "外研社，教学用书，共30本"),
+            ("大学物理实验", "图书", "ISBN 978-7-04-052834-4", "2024-02-28", 39.80, "图书馆 A区 3层 15架", "高等教育出版社"),
+            ("数据结构（C语言版）", "图书", "ISBN 978-7-302-33064-6", "2023-08-15", 49.00, "图书馆 B区 2层 03架", "严蔚敏著，清华大学出版社"),
+
+            # --- 教学器材 ---
+            ("人体骨骼模型", "教学器材", "170cm全身骨架", "2022-06-01", 1280.00, "生物教研室 501室", "医用级PVC材质"),
+            ("地球仪（大号）", "教学器材", "32cm带灯光", "2023-09-01", 158.00, "地理教研室 302室", "中英文标注，LED底灯"),
+            ("三角板教学套装", "教学器材", "60cm磁性", "2024-01-15", 89.00, "教学楼B栋 数学组", "含直尺、三角板、量角器"),
+
+            # --- 乐器 ---
+            ("雅马哈电钢琴", "乐器", "Yamaha P-145", "2024-01-10", 3299.00, "音乐教室 601室", "88键重锤，含X架和踏板"),
+            ("古典吉他", "乐器", "Yamaha C40", "2023-09-15", 699.00, "音乐教室 601室", "39寸入门款，共5把"),
+            ("竖笛（高音）", "乐器", "AULOS 204A", "2024-03-01", 68.00, "音乐教室 601室", "日本产，ABS树脂，共30支"),
+
+            # --- 家具 ---
+            ("学生课桌椅套装", "家具", "标准型 60x40cm", "2023-07-01", 280.00, "教学楼C栋 仓库", "钢木结构，可调高度，共200套"),
+            ("教师办公桌", "家具", "1.4m L型转角", "2024-01-20", 1580.00, "办公楼 305室", "含抽屉柜和键盘托"),
+        ]
+
+        for name, cat_name, model, pdate, price, loc, remark in items_data:
+            item = Item(
+                code=make_code(),
+                name=name,
+                category_id=cat_map[cat_name],
+                model=model,
+                status="available",
+                purchase_date=date.fromisoformat(pdate),
+                purchase_price=price,
+                location=loc,
+                remark=remark,
+            )
+            db.add(item)
+            db.flush()
+            # 生成二维码
+            qr_path = generate_qrcode(item.id, item.code)
+            item.qrcode_path = qr_path
+            print(f"  ✓ 物品: [{cat_name}] {name} → {item.code}")
+
+        db.commit()
+        print(f"\n=== 完成！共插入 {len(users)} 个用户、{len(categories_data)} 个分类、{len(items_data)} 个物品 ===")
+
+    finally:
+        db.close()
+
+
+if __name__ == "__main__":
+    print("=== 清理并重建测试数据 ===\n")
+    init_db()
+    run()
+
+============================================================
+backend/models/__init__.py
+============================================================
+"""ORM 模型 — 导入所有表，确保 Base.metadata 注册完整"""
+from models.user import User
+from models.category import Category
+from models.item import Item
+from models.borrow import BorrowRecord
+from models.scrap import ScrapRecord
+
+__all__ = ["User", "Category", "Item", "BorrowRecord", "ScrapRecord"]
+
+============================================================
+backend/models/borrow.py
+============================================================
+"""借用记录表"""
+from datetime import datetime, date
+from sqlalchemy import String, Date, DateTime, ForeignKey
+from sqlalchemy.orm import Mapped, mapped_column
+
+from database import Base
+
+
+class BorrowRecord(Base):
+    __tablename__ = "borrow_record"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    item_id: Mapped[int] = mapped_column(ForeignKey("item.id"), nullable=False, index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("user.id"), nullable=False, index=True)
+    borrow_date: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.now)
+    due_date: Mapped[date] = mapped_column(Date, nullable=False)
+    return_date: Mapped[datetime | None] = mapped_column(DateTime)
+    status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="active", index=True
+    )  # active / returned / overdue
+    purpose: Mapped[str | None] = mapped_column(String(200))
+    return_note: Mapped[str | None] = mapped_column(String(200))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+
+============================================================
+backend/models/category.py
+============================================================
+"""分类表"""
+from sqlalchemy import String
+from sqlalchemy.orm import Mapped, mapped_column
+
+from database import Base
+
+
+class Category(Base):
+    __tablename__ = "category"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(50), unique=True, nullable=False)
+    description: Mapped[str | None] = mapped_column(String(200))
+
+============================================================
+backend/models/item.py
+============================================================
+"""物品表"""
+from datetime import datetime, date
+from decimal import Decimal
+from sqlalchemy import String, Date, DateTime, Numeric, Text, ForeignKey
+from sqlalchemy.orm import Mapped, mapped_column
+
+from database import Base
+
+
+class Item(Base):
+    __tablename__ = "item"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    code: Mapped[str] = mapped_column(String(32), unique=True, nullable=False, index=True)
+    name: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+    category_id: Mapped[int | None] = mapped_column(ForeignKey("category.id"))
+    model: Mapped[str | None] = mapped_column(String(100))
+    status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="available", index=True
+    )  # available / borrowed / pending_scrap / scrapped
+    purchase_date: Mapped[date | None] = mapped_column(Date)
+    purchase_price: Mapped[Decimal | None] = mapped_column(Numeric(10, 2))
+    location: Mapped[str | None] = mapped_column(String(100))
+    qrcode_path: Mapped[str | None] = mapped_column(String(200))
+    remark: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+============================================================
+backend/models/scrap.py
+============================================================
+"""报废记录表"""
+from datetime import datetime
+from sqlalchemy import String, DateTime, Text, ForeignKey
+from sqlalchemy.orm import Mapped, mapped_column
+
+from database import Base
+
+
+class ScrapRecord(Base):
+    __tablename__ = "scrap_record"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    item_id: Mapped[int] = mapped_column(ForeignKey("item.id"), nullable=False, index=True)
+    applicant_id: Mapped[int] = mapped_column(ForeignKey("user.id"), nullable=False)
+    approver_id: Mapped[int | None] = mapped_column(ForeignKey("user.id"))
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="pending"
+    )  # pending / approved / rejected
+    apply_time: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.now)
+    approve_time: Mapped[datetime | None] = mapped_column(DateTime)
+    approve_note: Mapped[str | None] = mapped_column(String(200))
+
+============================================================
+backend/models/user.py
+============================================================
+"""用户表"""
+from datetime import datetime
+from sqlalchemy import String, Boolean, DateTime
+from sqlalchemy.orm import Mapped, mapped_column
+
+from database import Base
+
+
+class User(Base):
+    __tablename__ = "user"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    username: Mapped[str] = mapped_column(String(50), unique=True, nullable=False, index=True)
+    password_hash: Mapped[str] = mapped_column(String(128), nullable=False)
+    real_name: Mapped[str] = mapped_column(String(50), nullable=False)
+    role: Mapped[str] = mapped_column(String(20), nullable=False, default="student")  # admin / staff / student
+    phone: Mapped[str | None] = mapped_column(String(20))
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+============================================================
+backend/routers/__init__.py
+============================================================
+
+
+============================================================
+backend/routers/auth.py
+============================================================
+"""认证路由: /api/auth"""
+from fastapi import APIRouter, Depends, Response, Request
+from sqlalchemy.orm import Session
+
+from database import get_db
+from schemas.user import LoginRequest, UserOut
+from schemas.common import ApiResponse
+from services.user_service import authenticate
+from utils.auth import create_session, destroy_session
+from utils.deps import get_current_user
+from models.user import User
+
+router = APIRouter(prefix="/api/auth", tags=["认证"])
+
+
+@router.post("/login")
+def login(data: LoginRequest, response: Response, db: Session = Depends(get_db)):
+    user = authenticate(db, data.username, data.password)
+    if not user:
+        return ApiResponse(code=40101, msg="用户名或密码错误")
+
+    session_id = create_session(user.id, user.username, user.role, user.real_name)
+    response.set_cookie(
+        key="session_id",
+        value=session_id,
+        httponly=True,
+        samesite="lax",
+        max_age=86400,  # 24小时
+    )
+    return ApiResponse(data=UserOut.model_validate(user).model_dump())
+
+
+@router.post("/logout")
+def logout(request: Request, response: Response):
+    session_id = request.cookies.get("session_id")
+    if session_id:
+        destroy_session(session_id)
+    response.delete_cookie("session_id")
+    return ApiResponse(msg="已退出登录")
+
+
+@router.get("/me")
+def get_me(current_user: User = Depends(get_current_user)):
+    return ApiResponse(data=UserOut.model_validate(current_user).model_dump())
+
+============================================================
+backend/routers/borrows.py
+============================================================
+"""借用路由: /api/borrows"""
+from fastapi import APIRouter, Depends, Query
+from sqlalchemy.orm import Session
+
+from database import get_db
+from schemas.common import ApiResponse, PaginatedData
+from schemas.borrow import BorrowCreate, BorrowReturn, BorrowOut
+from services import borrow_service
+from utils.deps import get_current_user, require_admin
+from models.user import User
+from models.item import Item
+
+router = APIRouter(prefix="/api/borrows", tags=["借用管理"])
+
+
+def _borrow_to_out(record, db: Session) -> dict:
+    """BorrowRecord ORM → 输出 dict"""
+    d = BorrowOut.model_validate(record).model_dump()
+    item = db.query(Item).filter_by(id=record.item_id).first()
+    user = db.query(User).filter_by(id=record.user_id).first()
+    d["item_name"] = item.name if item else ""
+    d["item_code"] = item.code if item else ""
+    d["user_name"] = user.real_name if user else ""
+    return d
+
+
+@router.post("")
+def create_borrow(data: BorrowCreate, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    try:
+        record = borrow_service.borrow_item(db, data, current_user)
+        return ApiResponse(data=_borrow_to_out(record, db))
+    except ValueError as e:
+        return ApiResponse(code=40003, msg=str(e))
+
+
+@router.put("/{borrow_id}/return")
+def return_borrow(
+    borrow_id: int,
+    data: BorrowReturn,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    try:
+        record = borrow_service.return_item(db, borrow_id, current_user, data.return_note)
+        return ApiResponse(data=_borrow_to_out(record, db))
+    except ValueError as e:
+        return ApiResponse(code=40003, msg=str(e))
+
+
+@router.get("")
+def list_borrows(
+    status: str | None = None,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    records, total = borrow_service.list_borrows(db, status, page, page_size)
+    return ApiResponse(data=PaginatedData(
+        items=[_borrow_to_out(r, db) for r in records],
+        total=total,
+        page=page,
+        page_size=page_size,
+    ).model_dump())
+
+
+@router.get("/my")
+def my_borrows(
+    status: str | None = None,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    records, total = borrow_service.my_borrows(db, current_user.id, status, page, page_size)
+    return ApiResponse(data=PaginatedData(
+        items=[_borrow_to_out(r, db) for r in records],
+        total=total,
+        page=page,
+        page_size=page_size,
+    ).model_dump())
+
+
+@router.get("/overdue")
+def overdue_list(db: Session = Depends(get_db), admin: User = Depends(require_admin)):
+    records = borrow_service.list_overdue(db)
+    return ApiResponse(data=[_borrow_to_out(r, db) for r in records])
+
+============================================================
+backend/routers/dashboard.py
+============================================================
+"""仪表盘 & 报表路由: /api/dashboard"""
+from datetime import date
+from fastapi import APIRouter, Depends, Query
+from fastapi.responses import Response
+from sqlalchemy.orm import Session
+
+from database import get_db
+from schemas.common import ApiResponse
+from services import dashboard_service
+from utils.deps import get_current_user, require_admin
+from models.user import User
+
+router = APIRouter(prefix="/api/dashboard", tags=["仪表盘"])
+
+
+@router.get("/stats")
+def get_stats(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    data = dashboard_service.get_stats(db)
+    return ApiResponse(data=data)
+
+
+@router.get("/top-borrowed")
+def top_borrowed(
+    limit: int = Query(10, ge=1, le=50),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    data = dashboard_service.get_top_borrowed(db, limit)
+    return ApiResponse(data=data)
+
+
+@router.get("/reports/export")
+def export_report(
+    start_date: date | None = None,
+    end_date: date | None = None,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
+    csv_content = dashboard_service.export_borrow_report(db, start_date, end_date)
+    return Response(
+        content=csv_content.encode("utf-8-sig"),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=borrow_report.csv"},
+    )
+
+============================================================
+backend/routers/items.py
+============================================================
+"""物品路由: /api/items"""
+import csv
+import io
+from fastapi import APIRouter, Depends, UploadFile, File, Query
+from fastapi.responses import FileResponse, Response
+from sqlalchemy.orm import Session
+
+from database import get_db
+from schemas.common import ApiResponse, PaginatedData
+from schemas.item import ItemCreate, ItemUpdate, ItemOut, QrcodePdfRequest
+from services import item_service
+from services.qrcode_service import generate_qrcode, generate_qrcode_pdf
+from services.borrow_service import get_borrow_history
+from utils.deps import get_current_user, require_admin
+from models.user import User
+
+router = APIRouter(prefix="/api/items", tags=["物品管理"])
+
+
+def _item_to_out(item, db: Session) -> dict:
+    """Item ORM → 输出 dict（含 category_name）"""
+    d = ItemOut.model_validate(item).model_dump()
+    d["category_name"] = item_service.get_category_name(db, item.category_id)
+    return d
+
+
+@router.post("")
+def create_item(data: ItemCreate, db: Session = Depends(get_db), admin: User = Depends(require_admin)):
+    try:
+        item = item_service.create_item(db, data)
+        # 生成二维码
+        qr_path = generate_qrcode(item.id, item.code)
+        item.qrcode_path = qr_path
+        db.commit()
+        db.refresh(item)
+        return ApiResponse(data=_item_to_out(item, db))
+    except ValueError as e:
+        return ApiResponse(code=40002, msg=str(e))
+
+
+@router.get("")
+def list_items(
+    keyword: str | None = None,
+    category_id: int | None = None,
+    status: str | None = None,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    items, total = item_service.list_items(db, keyword, category_id, status, page, page_size)
+    return ApiResponse(data=PaginatedData(
+        items=[_item_to_out(i, db) for i in items],
+        total=total,
+        page=page,
+        page_size=page_size,
+    ).model_dump())
+
+
+@router.get("/categories")
+def list_categories(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    cats = item_service.list_categories(db)
+    return ApiResponse(data=[{"id": c.id, "name": c.name, "description": c.description} for c in cats])
+
+
+@router.get("/{item_id}")
+def get_item(item_id: int, db: Session = Depends(get_db)):
+    item = item_service.get_item(db, item_id)
+    if not item:
+        return ApiResponse(code=40001, msg="物品不存在")
+
+    data = _item_to_out(item, db)
+    # 附加借用历史
+    history = get_borrow_history(db, item_id, limit=5)
+    from models.user import User as UserModel
+    data["borrow_history"] = []
+    for h in history:
+        u = db.query(UserModel).filter_by(id=h.user_id).first()
+        data["borrow_history"].append({
+            "id": h.id,
+            "user_name": u.real_name if u else "",
+            "borrow_date": h.borrow_date.isoformat() if h.borrow_date else "",
+            "due_date": str(h.due_date) if h.due_date else "",
+            "return_date": h.return_date.isoformat() if h.return_date else None,
+            "status": h.status,
+        })
+    return ApiResponse(data=data)
+
+
+@router.put("/{item_id}")
+def update_item(item_id: int, data: ItemUpdate, db: Session = Depends(get_db), admin: User = Depends(require_admin)):
+    try:
+        item = item_service.update_item(db, item_id, data)
+        return ApiResponse(data=_item_to_out(item, db))
+    except ValueError as e:
+        return ApiResponse(code=40001, msg=str(e))
+
+
+@router.delete("/{item_id}")
+def delete_item(item_id: int, db: Session = Depends(get_db), admin: User = Depends(require_admin)):
+    try:
+        item_service.delete_item(db, item_id)
+        return ApiResponse(msg="删除成功")
+    except ValueError as e:
+        return ApiResponse(code=40003, msg=str(e))
+
+
+@router.get("/{item_id}/qrcode")
+def get_qrcode(item_id: int, db: Session = Depends(get_db)):
+    item = item_service.get_item(db, item_id)
+    if not item:
+        return ApiResponse(code=40001, msg="物品不存在")
+    if not item.qrcode_path:
+        # 按需生成
+        qr_path = generate_qrcode(item.id, item.code)
+        item.qrcode_path = qr_path
+        db.commit()
+    return FileResponse(item.qrcode_path, media_type="image/png")
+
+
+@router.post("/qrcode-pdf")
+def batch_qrcode_pdf(data: QrcodePdfRequest, db: Session = Depends(get_db), admin: User = Depends(require_admin)):
+    items = []
+    for iid in data.item_ids:
+        item = item_service.get_item(db, iid)
+        if item:
+            if not item.qrcode_path:
+                item.qrcode_path = generate_qrcode(item.id, item.code)
+                db.commit()
+            items.append({"qrcode_path": item.qrcode_path, "name": item.name, "code": item.code})
+
+    if not items:
+        return ApiResponse(code=40001, msg="未找到有效物品")
+
+    pdf_path = generate_qrcode_pdf(items)
+    return FileResponse(pdf_path, media_type="application/pdf", filename="qrcodes.pdf")
+
+
+@router.post("/import")
+async def import_csv(file: UploadFile = File(...), db: Session = Depends(get_db), admin: User = Depends(require_admin)):
+    """CSV 批量导入物品"""
+    content = await file.read()
+    text = content.decode("utf-8-sig")
+    reader = csv.reader(io.StringIO(text))
+
+    created = 0
+    errors = []
+    for row_num, row in enumerate(reader, 1):
+        if row_num == 1 and row[0].startswith("名称"):
+            continue  # 跳过表头
+        if len(row) < 1:
+            continue
+        try:
+            # CSV: 名称,分类,型号,购入日期,价格,位置,备注
+            name = row[0].strip()
+            category_name = row[1].strip() if len(row) > 1 else ""
+            model_val = row[2].strip() if len(row) > 2 else None
+            purchase_date = row[3].strip() if len(row) > 3 else None
+            price = row[4].strip() if len(row) > 4 else None
+            location = row[5].strip() if len(row) > 5 else None
+            remark = row[6].strip() if len(row) > 6 else None
+
+            # 查找分类 ID
+            cat_id = None
+            if category_name:
+                from models.category import Category
+                cat = db.query(Category).filter_by(name=category_name).first()
+                if cat:
+                    cat_id = cat.id
+
+            from decimal import Decimal
+            from datetime import date as dt_date
+            item_data = ItemCreate(
+                name=name,
+                category_id=cat_id,
+                model=model_val or None,
+                purchase_date=dt_date.fromisoformat(purchase_date) if purchase_date else None,
+                purchase_price=Decimal(price) if price else None,
+                location=location or None,
+                remark=remark or None,
+            )
+            item = item_service.create_item(db, item_data)
+            qr_path = generate_qrcode(item.id, item.code)
+            item.qrcode_path = qr_path
+            db.commit()
+            created += 1
+        except Exception as e:
+            errors.append(f"第{row_num}行: {str(e)}")
+
+    return ApiResponse(data={"created": created, "errors": errors})
+
+============================================================
+backend/routers/scraps.py
+============================================================
+"""报废路由: /api/scraps"""
+from fastapi import APIRouter, Depends, Query
+from sqlalchemy.orm import Session
+
+from database import get_db
+from schemas.common import ApiResponse, PaginatedData
+from schemas.scrap import ScrapCreate, ScrapApprove, ScrapOut
+from services import scrap_service
+from utils.deps import get_current_user, require_admin
+from models.user import User
+from models.item import Item
+
+router = APIRouter(prefix="/api/scraps", tags=["报废管理"])
+
+
+def _scrap_to_out(record, db: Session) -> dict:
+    """ScrapRecord ORM → 输出 dict"""
+    d = ScrapOut.model_validate(record).model_dump()
+    item = db.query(Item).filter_by(id=record.item_id).first()
+    applicant = db.query(User).filter_by(id=record.applicant_id).first()
+    d["item_name"] = item.name if item else ""
+    d["item_code"] = item.code if item else ""
+    d["applicant_name"] = applicant.real_name if applicant else ""
+    if record.approver_id:
+        approver = db.query(User).filter_by(id=record.approver_id).first()
+        d["approver_name"] = approver.real_name if approver else ""
+    return d
+
+
+@router.post("")
+def create_scrap(data: ScrapCreate, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    try:
+        record = scrap_service.apply_scrap(db, data.item_id, data.reason, current_user)
+        return ApiResponse(data=_scrap_to_out(record, db))
+    except ValueError as e:
+        return ApiResponse(code=40003, msg=str(e))
+
+
+@router.put("/{scrap_id}/approve")
+def approve_scrap(
+    scrap_id: int,
+    data: ScrapApprove,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
+    try:
+        record = scrap_service.approve_scrap(db, scrap_id, admin, data.approve_note)
+        return ApiResponse(data=_scrap_to_out(record, db))
+    except ValueError as e:
+        return ApiResponse(code=40003, msg=str(e))
+
+
+@router.put("/{scrap_id}/reject")
+def reject_scrap(
+    scrap_id: int,
+    data: ScrapApprove,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
+    try:
+        record = scrap_service.reject_scrap(db, scrap_id, admin, data.approve_note)
+        return ApiResponse(data=_scrap_to_out(record, db))
+    except ValueError as e:
+        return ApiResponse(code=40003, msg=str(e))
+
+
+@router.get("")
+def list_scraps(
+    status: str | None = None,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    records, total = scrap_service.list_scraps(db, status, page, page_size)
+    return ApiResponse(data=PaginatedData(
+        items=[_scrap_to_out(r, db) for r in records],
+        total=total,
+        page=page,
+        page_size=page_size,
+    ).model_dump())
+
+============================================================
+backend/routers/users.py
+============================================================
+"""用户管理路由: /api/users"""
+from fastapi import APIRouter, Depends, Query
+from sqlalchemy.orm import Session
+
+from database import get_db
+from schemas.common import ApiResponse, PaginatedData
+from schemas.user import UserCreate, UserUpdate, UserOut
+from services import user_service
+from utils.deps import require_admin
+from models.user import User
+
+router = APIRouter(prefix="/api/users", tags=["用户管理"])
+
+
+@router.get("")
+def list_users(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
+    users, total = user_service.list_users(db, page, page_size)
+    return ApiResponse(data=PaginatedData(
+        items=[UserOut.model_validate(u).model_dump() for u in users],
+        total=total,
+        page=page,
+        page_size=page_size,
+    ).model_dump())
+
+
+@router.post("")
+def create_user(data: UserCreate, db: Session = Depends(get_db), admin: User = Depends(require_admin)):
+    try:
+        user = user_service.create_user(db, data)
+        return ApiResponse(data=UserOut.model_validate(user).model_dump())
+    except ValueError as e:
+        return ApiResponse(code=40002, msg=str(e))
+
+
+@router.put("/{user_id}")
+def update_user(user_id: int, data: UserUpdate, db: Session = Depends(get_db), admin: User = Depends(require_admin)):
+    try:
+        user = user_service.update_user(db, user_id, data)
+        return ApiResponse(data=UserOut.model_validate(user).model_dump())
+    except ValueError as e:
+        return ApiResponse(code=40001, msg=str(e))
+
+
+@router.put("/{user_id}/disable")
+def disable_user(user_id: int, db: Session = Depends(get_db), admin: User = Depends(require_admin)):
+    try:
+        user = user_service.disable_user(db, user_id)
+        return ApiResponse(data=UserOut.model_validate(user).model_dump())
+    except ValueError as e:
+        return ApiResponse(code=40001, msg=str(e))
+
+============================================================
+backend/schemas/__init__.py
+============================================================
+"""Pydantic 请求/响应模型"""
+
+============================================================
+backend/schemas/borrow.py
+============================================================
+"""借用相关 Schema"""
+from datetime import datetime, date
+from pydantic import BaseModel
+
+
+class BorrowCreate(BaseModel):
+    item_id: int
+    due_date: date
+    purpose: str | None = None
+
+
+class BorrowReturn(BaseModel):
+    return_note: str | None = None
+
+
+class BorrowOut(BaseModel):
+    id: int
+    item_id: int
+    item_name: str | None = None
+    item_code: str | None = None
+    user_id: int
+    user_name: str | None = None
+    borrow_date: datetime
+    due_date: date
+    return_date: datetime | None = None
+    status: str
+    purpose: str | None = None
+    return_note: str | None = None
+
+    model_config = {"from_attributes": True}
+
+============================================================
+backend/schemas/common.py
+============================================================
+"""通用响应模型"""
+from typing import Any
+from pydantic import BaseModel
+
+
+class ApiResponse(BaseModel):
+    """统一响应格式"""
+    code: int = 0
+    data: Any = None
+    msg: str = "ok"
+
+
+class PaginatedData(BaseModel):
+    """分页数据"""
+    items: list = []
+    total: int = 0
+    page: int = 1
+    page_size: int = 20
+
+============================================================
+backend/schemas/item.py
+============================================================
+"""物品相关 Schema"""
+from datetime import datetime, date
+from decimal import Decimal
+from pydantic import BaseModel
+
+
+class ItemCreate(BaseModel):
+    name: str
+    category_id: int | None = None
+    model: str | None = None
+    purchase_date: date | None = None
+    purchase_price: Decimal | None = None
+    location: str | None = None
+    remark: str | None = None
+
+
+class ItemUpdate(BaseModel):
+    name: str | None = None
+    category_id: int | None = None
+    model: str | None = None
+    purchase_date: date | None = None
+    purchase_price: Decimal | None = None
+    location: str | None = None
+    remark: str | None = None
+
+
+class ItemOut(BaseModel):
+    id: int
+    code: str
+    name: str
+    category_id: int | None = None
+    category_name: str | None = None
+    model: str | None = None
+    status: str
+    purchase_date: date | None = None
+    purchase_price: Decimal | None = None
+    location: str | None = None
+    qrcode_path: str | None = None
+    remark: str | None = None
+    created_at: datetime | None = None
+
+    model_config = {"from_attributes": True}
+
+
+class QrcodePdfRequest(BaseModel):
+    item_ids: list[int]
+
+============================================================
+backend/schemas/scrap.py
+============================================================
+"""报废相关 Schema"""
+from datetime import datetime
+from pydantic import BaseModel
+
+
+class ScrapCreate(BaseModel):
+    item_id: int
+    reason: str
+
+
+class ScrapApprove(BaseModel):
+    approve_note: str | None = None
+
+
+class ScrapOut(BaseModel):
+    id: int
+    item_id: int
+    item_name: str | None = None
+    item_code: str | None = None
+    applicant_id: int
+    applicant_name: str | None = None
+    approver_id: int | None = None
+    approver_name: str | None = None
+    reason: str
+    status: str
+    apply_time: datetime
+    approve_time: datetime | None = None
+    approve_note: str | None = None
+
+    model_config = {"from_attributes": True}
+
+============================================================
+backend/schemas/user.py
+============================================================
+"""用户相关 Schema"""
+from datetime import datetime
+from pydantic import BaseModel
+
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+class UserCreate(BaseModel):
+    username: str
+    password: str
+    real_name: str
+    role: str = "student"  # admin / staff / student
+    phone: str | None = None
+
+
+class UserUpdate(BaseModel):
+    real_name: str | None = None
+    role: str | None = None
+    phone: str | None = None
+    is_active: bool | None = None
+
+
+class UserOut(BaseModel):
+    id: int
+    username: str
+    real_name: str
+    role: str
+    phone: str | None = None
+    is_active: bool = True
+    created_at: datetime | None = None
+
+    model_config = {"from_attributes": True}
+
+============================================================
+backend/services/__init__.py
+============================================================
+
+
+============================================================
+backend/services/borrow_service.py
+============================================================
+"""借用业务逻辑"""
+from datetime import datetime, date, timedelta
+from sqlalchemy.orm import Session
+
+from models.borrow import BorrowRecord
+from models.item import Item
+from models.user import User
+from schemas.borrow import BorrowCreate
+
+
+def borrow_item(db: Session, data: BorrowCreate, user: User) -> BorrowRecord:
+    """发起借用"""
+    item = db.query(Item).filter_by(id=data.item_id).first()
+    if not item:
+        raise ValueError("物品不存在")
+    if item.status != "available":
+        raise ValueError(f"物品当前状态为「{item.status}」，不可借用")
+
+    # 检查 due_date
+    if data.due_date < date.today():
+        raise ValueError("归还日期不能早于今天")
+    if data.due_date > date.today() + timedelta(days=90):
+        raise ValueError("借期最长 90 天")
+
+    # 检查用户未归还数量
+    active_count = (
+        db.query(BorrowRecord)
+        .filter_by(user_id=user.id, status="active")
+        .count()
+    )
+    if active_count >= 10:
+        raise ValueError("您当前未归还物品已达上限（10件）")
+
+    # 事务：插入借用记录 + 更新物品状态
+    record = BorrowRecord(
+        item_id=data.item_id,
+        user_id=user.id,
+        due_date=data.due_date,
+        purpose=data.purpose,
+        status="active",
+    )
+    item.status = "borrowed"
+
+    db.add(record)
+    db.commit()
+    db.refresh(record)
+    return record
+
+
+def return_item(db: Session, borrow_id: int, user: User, return_note: str | None = None) -> BorrowRecord:
+    """归还物品"""
+    record = db.query(BorrowRecord).filter_by(id=borrow_id).first()
+    if not record:
+        raise ValueError("借用记录不存在")
+    if record.status == "returned":
+        raise ValueError("该借用记录已归还")
+
+    # 权限：本人或管理员
+    if record.user_id != user.id and user.role != "admin":
+        raise ValueError("只能归还自己的借用记录")
+
+    record.status = "returned"
+    record.return_date = datetime.now()
+    record.return_note = return_note
+
+    # 恢复物品状态（如果物品不是待报废）
+    item = db.query(Item).filter_by(id=record.item_id).first()
+    if item and item.status == "borrowed":
+        item.status = "available"
+
+    db.commit()
+    db.refresh(record)
+    return record
+
+
+def list_borrows(
+    db: Session,
+    status: str | None = None,
+    page: int = 1,
+    page_size: int = 20,
+):
+    """所有借用记录"""
+    q = db.query(BorrowRecord)
+    if status:
+        q = q.filter(BorrowRecord.status == status)
+
+    total = q.count()
+    records = (
+        q.order_by(BorrowRecord.id.desc())
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+        .all()
+    )
+    return records, total
+
+
+def my_borrows(
+    db: Session,
+    user_id: int,
+    status: str | None = None,
+    page: int = 1,
+    page_size: int = 20,
+):
+    """我的借用记录"""
+    q = db.query(BorrowRecord).filter_by(user_id=user_id)
+    if status:
+        q = q.filter(BorrowRecord.status == status)
+
+    total = q.count()
+    records = (
+        q.order_by(BorrowRecord.id.desc())
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+        .all()
+    )
+    return records, total
+
+
+def list_overdue(db: Session):
+    """逾期列表"""
+    return (
+        db.query(BorrowRecord)
+        .filter(
+            BorrowRecord.status.in_(["active", "overdue"]),
+            BorrowRecord.due_date < date.today(),
+        )
+        .order_by(BorrowRecord.due_date)
+        .all()
+    )
+
+
+def mark_overdue(db: Session):
+    """定时任务：标记逾期"""
+    records = (
+        db.query(BorrowRecord)
+        .filter(
+            BorrowRecord.status == "active",
+            BorrowRecord.due_date < date.today(),
+        )
+        .all()
+    )
+    for r in records:
+        r.status = "overdue"
+    db.commit()
+    return len(records)
+
+
+def get_borrow_history(db: Session, item_id: int, limit: int = 5):
+    """物品的借用历史"""
+    return (
+        db.query(BorrowRecord)
+        .filter_by(item_id=item_id)
+        .order_by(BorrowRecord.id.desc())
+        .limit(limit)
+        .all()
+    )
+
+============================================================
+backend/services/dashboard_service.py
+============================================================
+"""仪表盘 & 报表业务逻辑"""
+import csv
+import io
+from datetime import date
+from sqlalchemy import func
+from sqlalchemy.orm import Session
+
+from models.item import Item
+from models.borrow import BorrowRecord
+from models.user import User
+
+
+def get_stats(db: Session) -> dict:
+    """统计概览"""
+    total = db.query(Item).count()
+    available = db.query(Item).filter_by(status="available").count()
+    borrowed = db.query(Item).filter_by(status="borrowed").count()
+    scrapped = db.query(Item).filter_by(status="scrapped").count()
+
+    overdue = (
+        db.query(BorrowRecord)
+        .filter(
+            BorrowRecord.status.in_(["active", "overdue"]),
+            BorrowRecord.due_date < date.today(),
+        )
+        .count()
+    )
+
+    return {
+        "total_items": total,
+        "available_count": available,
+        "borrowed_count": borrowed,
+        "overdue_count": overdue,
+        "scrapped_count": scrapped,
+    }
+
+
+def get_top_borrowed(db: Session, limit: int = 10) -> list:
+    """借用频次 Top N"""
+    results = (
+        db.query(
+            BorrowRecord.item_id,
+            Item.name,
+            Item.code,
+            func.count(BorrowRecord.id).label("borrow_count"),
+        )
+        .join(Item, BorrowRecord.item_id == Item.id)
+        .group_by(BorrowRecord.item_id)
+        .order_by(func.count(BorrowRecord.id).desc())
+        .limit(limit)
+        .all()
+    )
+    return [
+        {
+            "item_id": r.item_id,
+            "name": r.name,
+            "code": r.code,
+            "borrow_count": r.borrow_count,
+        }
+        for r in results
+    ]
+
+
+def export_borrow_report(db: Session, start_date: date | None = None, end_date: date | None = None) -> str:
+    """导出借用报表 CSV，返回 CSV 字符串"""
+    q = db.query(BorrowRecord).join(Item, BorrowRecord.item_id == Item.id).join(User, BorrowRecord.user_id == User.id)
+
+    if start_date:
+        q = q.filter(BorrowRecord.borrow_date >= start_date)
+    if end_date:
+        q = q.filter(BorrowRecord.borrow_date <= end_date)
+
+    records = q.order_by(BorrowRecord.borrow_date.desc()).all()
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["借用ID", "物品编号", "物品名称", "借用人", "借出日期", "应还日期", "实际归还", "状态", "用途"])
+
+    for r in records:
+        item = db.query(Item).filter_by(id=r.item_id).first()
+        user = db.query(User).filter_by(id=r.user_id).first()
+        writer.writerow([
+            r.id,
+            item.code if item else "",
+            item.name if item else "",
+            user.real_name if user else "",
+            r.borrow_date.strftime("%Y-%m-%d") if r.borrow_date else "",
+            str(r.due_date) if r.due_date else "",
+            r.return_date.strftime("%Y-%m-%d") if r.return_date else "未归还",
+            r.status,
+            r.purpose or "",
+        ])
+
+    return output.getvalue()
+
+============================================================
+backend/services/item_service.py
+============================================================
+"""物品业务逻辑"""
+from datetime import date
+from sqlalchemy.orm import Session
+from sqlalchemy import func
+
+from models.item import Item
+from models.category import Category
+from schemas.item import ItemCreate, ItemUpdate
+
+
+def generate_item_code(db: Session) -> str:
+    """生成物品编号: ITM-YYYYMMDD-XXXX"""
+    today = date.today().strftime("%Y%m%d")
+    prefix = f"ITM-{today}-"
+
+    # 查询当天最大编号
+    last = (
+        db.query(Item.code)
+        .filter(Item.code.like(f"{prefix}%"))
+        .order_by(Item.code.desc())
+        .first()
+    )
+
+    if last:
+        seq = int(last[0].split("-")[-1]) + 1
+    else:
+        seq = 1
+
+    return f"{prefix}{seq:04d}"
+
+
+def create_item(db: Session, data: ItemCreate) -> Item:
+    """录入物品"""
+    # 校验分类存在
+    if data.category_id:
+        cat = db.query(Category).filter_by(id=data.category_id).first()
+        if not cat:
+            raise ValueError("分类不存在")
+
+    code = generate_item_code(db)
+    item = Item(
+        code=code,
+        name=data.name,
+        category_id=data.category_id,
+        model=data.model,
+        status="available",
+        purchase_date=data.purchase_date,
+        purchase_price=data.purchase_price,
+        location=data.location,
+        remark=data.remark,
+    )
+    db.add(item)
+    db.commit()
+    db.refresh(item)
+    return item
+
+
+def get_item(db: Session, item_id: int) -> Item | None:
+    """获取单个物品"""
+    return db.query(Item).filter_by(id=item_id).first()
+
+
+def list_items(
+    db: Session,
+    keyword: str | None = None,
+    category_id: int | None = None,
+    status: str | None = None,
+    page: int = 1,
+    page_size: int = 20,
+):
+    """分页查询物品列表"""
+    q = db.query(Item)
+
+    if keyword:
+        q = q.filter(
+            (Item.name.contains(keyword)) | (Item.code.contains(keyword))
+        )
+    if category_id:
+        q = q.filter(Item.category_id == category_id)
+    if status:
+        q = q.filter(Item.status == status)
+
+    total = q.count()
+    items = (
+        q.order_by(Item.id.desc())
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+        .all()
+    )
+    return items, total
+
+
+def update_item(db: Session, item_id: int, data: ItemUpdate) -> Item:
+    """更新物品"""
+    item = db.query(Item).filter_by(id=item_id).first()
+    if not item:
+        raise ValueError("物品不存在")
+
+    for field, value in data.model_dump(exclude_unset=True).items():
+        setattr(item, field, value)
+
+    db.commit()
+    db.refresh(item)
+    return item
+
+
+def delete_item(db: Session, item_id: int):
+    """删除物品"""
+    item = db.query(Item).filter_by(id=item_id).first()
+    if not item:
+        raise ValueError("物品不存在")
+    if item.status == "borrowed":
+        raise ValueError("物品正在借出中，不能删除")
+
+    db.delete(item)
+    db.commit()
+
+
+def get_category_name(db: Session, category_id: int | None) -> str | None:
+    """获取分类名称"""
+    if not category_id:
+        return None
+    cat = db.query(Category).filter_by(id=category_id).first()
+    return cat.name if cat else None
+
+
+def list_categories(db: Session):
+    """获取所有分类"""
+    return db.query(Category).all()
+
+============================================================
+backend/services/qrcode_service.py
+============================================================
+"""二维码生成 & PDF 导出"""
+import os
+import qrcode
+from datetime import datetime
+from reportlab.lib.pagesizes import A4
+from reportlab.pdfgen import canvas
+
+from config import SERVER_HOST, QRCODE_DIR, EXPORT_DIR
+
+
+def generate_qrcode(item_id: int, item_code: str) -> str:
+    """生成二维码图片，返回保存路径"""
+    os.makedirs(QRCODE_DIR, exist_ok=True)
+
+    url = f"http://{SERVER_HOST}/items/{item_id}"
+
+    qr = qrcode.QRCode(version=1, box_size=10, border=2)
+    qr.add_data(url)
+    qr.make(fit=True)
+    img = qr.make_image(fill_color="black", back_color="white")
+
+    path = os.path.join(QRCODE_DIR, f"{item_code}.png")
+    img.save(path)
+    return path
+
+
+def generate_qrcode_pdf(items: list) -> str:
+    """生成包含多个物品二维码的 PDF
+    
+    items: list of dicts with keys: qrcode_path, name, code
+    """
+    os.makedirs(EXPORT_DIR, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+    pdf_path = os.path.join(EXPORT_DIR, f"qrcodes_{timestamp}.pdf")
+
+    c = canvas.Canvas(pdf_path, pagesize=A4)
+    width, height = A4
+    cols, rows = 2, 4  # 每页 2列 x 4行
+    cell_w = width / cols
+    cell_h = height / rows
+
+    for i, item in enumerate(items):
+        page_idx = i % (cols * rows)
+        if page_idx == 0 and i > 0:
+            c.showPage()
+
+        col = page_idx % cols
+        row = page_idx // cols
+
+        x = col * cell_w + 20
+        y = height - (row + 1) * cell_h + 20
+
+        # 画二维码图片
+        qr_path = item.get("qrcode_path") or ""
+        if os.path.exists(qr_path):
+            c.drawImage(qr_path, x, y + 30, 80, 80)
+
+        # 物品名称
+        c.setFont("Helvetica", 10)
+        c.drawString(x, y + 15, item.get("name", ""))
+        # 物品编号
+        c.setFont("Helvetica", 8)
+        c.drawString(x, y, item.get("code", ""))
+
+    c.save()
+    return pdf_path
+
+============================================================
+backend/services/scrap_service.py
+============================================================
+"""报废业务逻辑"""
+from datetime import datetime
+from sqlalchemy.orm import Session
+
+from models.scrap import ScrapRecord
+from models.item import Item
+from models.user import User
+
+
+def apply_scrap(db: Session, item_id: int, reason: str, applicant: User) -> ScrapRecord:
+    """发起报废申请"""
+    item = db.query(Item).filter_by(id=item_id).first()
+    if not item:
+        raise ValueError("物品不存在")
+    if item.status == "scrapped":
+        raise ValueError("物品已报废")
+    if item.status == "pending_scrap":
+        raise ValueError("物品已有待审批的报废申请")
+
+    # 检查是否已有 pending 的报废申请
+    existing = (
+        db.query(ScrapRecord)
+        .filter_by(item_id=item_id, status="pending")
+        .first()
+    )
+    if existing:
+        raise ValueError("该物品已有待审批的报废申请")
+
+    record = ScrapRecord(
+        item_id=item_id,
+        applicant_id=applicant.id,
+        reason=reason,
+        status="pending",
+    )
+    item.status = "pending_scrap"
+
+    db.add(record)
+    db.commit()
+    db.refresh(record)
+    return record
+
+
+def approve_scrap(db: Session, scrap_id: int, approver: User, approve_note: str | None = None) -> ScrapRecord:
+    """审批通过报废"""
+    record = db.query(ScrapRecord).filter_by(id=scrap_id).first()
+    if not record:
+        raise ValueError("报废记录不存在")
+    if record.status != "pending":
+        raise ValueError("该申请不在待审批状态")
+
+    record.status = "approved"
+    record.approver_id = approver.id
+    record.approve_time = datetime.now()
+    record.approve_note = approve_note
+
+    # 物品状态 → scrapped
+    item = db.query(Item).filter_by(id=record.item_id).first()
+    if item:
+        item.status = "scrapped"
+
+    db.commit()
+    db.refresh(record)
+    return record
+
+
+def reject_scrap(db: Session, scrap_id: int, approver: User, approve_note: str | None = None) -> ScrapRecord:
+    """审批驳回报废"""
+    record = db.query(ScrapRecord).filter_by(id=scrap_id).first()
+    if not record:
+        raise ValueError("报废记录不存在")
+    if record.status != "pending":
+        raise ValueError("该申请不在待审批状态")
+
+    record.status = "rejected"
+    record.approver_id = approver.id
+    record.approve_time = datetime.now()
+    record.approve_note = approve_note
+
+    # 恢复物品状态
+    item = db.query(Item).filter_by(id=record.item_id).first()
+    if item and item.status == "pending_scrap":
+        # 检查是否有活跃借用记录来决定恢复什么状态
+        from models.borrow import BorrowRecord
+        active_borrow = (
+            db.query(BorrowRecord)
+            .filter_by(item_id=item.id, status="active")
+            .first()
+        )
+        item.status = "borrowed" if active_borrow else "available"
+
+    db.commit()
+    db.refresh(record)
+    return record
+
+
+def list_scraps(
+    db: Session,
+    status: str | None = None,
+    page: int = 1,
+    page_size: int = 20,
+):
+    """报废申请列表"""
+    q = db.query(ScrapRecord)
+    if status:
+        q = q.filter(ScrapRecord.status == status)
+
+    total = q.count()
+    records = (
+        q.order_by(ScrapRecord.id.desc())
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+        .all()
+    )
+    return records, total
+
+============================================================
+backend/services/user_service.py
+============================================================
+"""用户业务逻辑"""
+from sqlalchemy.orm import Session
+
+from models.user import User
+from schemas.user import UserCreate, UserUpdate
+from utils.auth import hash_password, verify_password
+
+
+def authenticate(db: Session, username: str, password: str) -> User | None:
+    """验证用户名密码，成功返回 User，失败返回 None"""
+    user = db.query(User).filter_by(username=username).first()
+    if not user or not user.is_active:
+        return None
+    if not verify_password(password, user.password_hash):
+        return None
+    return user
+
+
+def create_user(db: Session, data: UserCreate) -> User:
+    """创建用户"""
+    existing = db.query(User).filter_by(username=data.username).first()
+    if existing:
+        raise ValueError(f"用户名 '{data.username}' 已存在")
+
+    user = User(
+        username=data.username,
+        password_hash=hash_password(data.password),
+        real_name=data.real_name,
+        role=data.role,
+        phone=data.phone,
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return user
+
+
+def update_user(db: Session, user_id: int, data: UserUpdate) -> User:
+    """更新用户信息"""
+    user = db.query(User).filter_by(id=user_id).first()
+    if not user:
+        raise ValueError("用户不存在")
+
+    for field, value in data.model_dump(exclude_unset=True).items():
+        setattr(user, field, value)
+
+    db.commit()
+    db.refresh(user)
+    return user
+
+
+def list_users(db: Session, page: int = 1, page_size: int = 20):
+    """分页查询用户列表"""
+    total = db.query(User).count()
+    users = (
+        db.query(User)
+        .order_by(User.id)
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+        .all()
+    )
+    return users, total
+
+
+def disable_user(db: Session, user_id: int) -> User:
+    """禁用用户"""
+    user = db.query(User).filter_by(id=user_id).first()
+    if not user:
+        raise ValueError("用户不存在")
+    user.is_active = False
+    db.commit()
+    db.refresh(user)
+    return user
+
+============================================================
+backend/utils/__init__.py
+============================================================
+
+
+============================================================
+backend/utils/auth.py
+============================================================
+"""Session 认证工具 — 基于 Cookie 的 Session 管理"""
+import hashlib
+import uuid
+from datetime import datetime
+
+
+def hash_password(password: str) -> str:
+    """密码哈希 (SHA256)"""
+    return hashlib.sha256(password.encode()).hexdigest()
+
+
+def verify_password(plain: str, hashed: str) -> bool:
+    """验证密码"""
+    return hash_password(plain) == hashed
+
+
+def generate_session_id() -> str:
+    """生成随机 Session ID"""
+    return uuid.uuid4().hex
+
+
+# 内存 Session 存储 — 单机够用，重启后需重新登录
+# 格式: {session_id: {"user_id": int, "username": str, "role": str, "created": datetime}}
+_sessions: dict[str, dict] = {}
+
+
+def create_session(user_id: int, username: str, role: str, real_name: str) -> str:
+    """创建 Session，返回 session_id"""
+    sid = generate_session_id()
+    _sessions[sid] = {
+        "user_id": user_id,
+        "username": username,
+        "role": role,
+        "real_name": real_name,
+        "created": datetime.now(),
+    }
+    return sid
+
+
+def get_session(session_id: str) -> dict | None:
+    """根据 session_id 获取 Session 数据"""
+    return _sessions.get(session_id)
+
+
+def destroy_session(session_id: str):
+    """销毁 Session"""
+    _sessions.pop(session_id, None)
+
+============================================================
+backend/utils/deps.py
+============================================================
+"""FastAPI 依赖注入"""
+from fastapi import Request, Depends, HTTPException
+from sqlalchemy.orm import Session
+
+from database import get_db
+from utils.auth import get_session
+from models.user import User
+
+
+def get_current_user(request: Request, db: Session = Depends(get_db)) -> User:
+    """从 Cookie 中读取 session_id，获取当前登录用户"""
+    session_id = request.cookies.get("session_id")
+    if not session_id:
+        raise HTTPException(status_code=401, detail="未登录")
+
+    session_data = get_session(session_id)
+    if not session_data:
+        raise HTTPException(status_code=401, detail="Session 已过期，请重新登录")
+
+    user = db.query(User).filter_by(id=session_data["user_id"]).first()
+    if not user or not user.is_active:
+        raise HTTPException(status_code=401, detail="用户不存在或已禁用")
+
+    return user
+
+
+def require_admin(current_user: User = Depends(get_current_user)) -> User:
+    """要求管理员权限"""
+    if current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="权限不足，需要管理员权限")
+    return current_user
+
